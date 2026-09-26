@@ -11,6 +11,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import re
 import urllib.request
 import unittest
 from pathlib import Path
@@ -185,6 +186,35 @@ class TestHelpSurface(unittest.TestCase):
         _code, out, _err = run_cli("--help")
         for command in referenced:
             self.assertIn(command, out, f"unit calls {command}, which the CLI does not have")
+
+    def test_advice_printed_to_the_user_names_real_commands(self):
+        """Every `qwen38 <cmd>` in a message, docstring or comment must exist.
+
+        This caught a real one: a warning told the operator to run
+        `qwen38 preflight`, a command that was never written. Advice that points
+        at a nonexistent command is worse than no advice, because the reader
+        concludes the tool is unreliable rather than that one string is stale.
+        """
+        sources = [*_ROOT.glob("bin/*"), *_ROOT.glob("lib/qwen38/*.py"),
+                   *_ROOT.glob("docs/*.md"), _ROOT / "README.md",
+                   *_ROOT.glob("*.sh"), *_ROOT.glob("unit/*")]
+        pattern = re.compile(r"\bqwen38 ([a-z][a-z-]+)")
+        known = set(self.NAMES) | {"--help"}
+        offenders: list[str] = []
+        for path in sources:
+            if not path.is_file():
+                continue
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                # Python imports read as "from qwen38 import x", which is a module
+                # path, not advice to a human. Skipping them keeps the rule about
+                # what the tool tells people to type.
+                if line.lstrip().startswith(("from ", "import ")):
+                    continue
+                for match in pattern.finditer(line):
+                    word = match.group(1)
+                    if word not in known:
+                        offenders.append(f"{path.relative_to(_ROOT)}:{lineno}: qwen38 {word}")
+        self.assertEqual(offenders, [], "\n" + "\n".join(offenders))
 
 
 class TestLocalRequestsBypassProxies(unittest.TestCase):

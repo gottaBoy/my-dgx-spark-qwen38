@@ -41,12 +41,15 @@ Q38_IMAGE_ALIAS="lmsysorg/sglang:dev-qwen38-27b-dflash2"
 
 # --- model -------------------------------------------------------------------
 Q38_MODEL="RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
-# Revision pin is deliberately empty for the target (the NVFP4 export publishes
-# a single revision today) and set for the draft, which moves. bin/qwen38
-# doctor refuses to start a pinned repo whose revision is unresolvable.
+# Empty for the target: pinning a revision that no longer exists fails the boot,
+# and this export has moved before. Set it deliberately, per repo, once you have
+# resolved the sha you want (see Q38_DRAFT_REVISION for the shape).
 Q38_MODEL_REVISION=""
 Q38_DRAFT_MODEL="z-lab/Qwen3.8-27B-DFlash2"
-Q38_DRAFT_REVISION="50307d4"
+# Full 40-char sha, not the short form. SGLang resolves this through the Hub, and
+# a short sha is a convenience of the web UI that no flag here promises to accept.
+# MiaAI-Lab pins the same commit as this full sha.
+Q38_DRAFT_REVISION="50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 Q38_SERVED_NAME="qwen3.8-27b"
 
 # --- serving shape -----------------------------------------------------------

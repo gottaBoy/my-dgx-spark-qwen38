@@ -50,6 +50,24 @@ def _run(argv: list[str], *, timeout: int = 60, check: bool = False,
     return proc
 
 
+def _run_passthrough(argv: list[str], *, timeout: int = 7200) -> int:
+    """Run a long command with its output attached to our terminal.
+
+    `_run` captures, which is right for the one-line queries that dominate this
+    CLI and wrong for anything a human waits on: the first real `pull --pull`
+    showed nothing at all for the entire 14 GB, which reads as a hang and invites
+    a Ctrl+C that would have killed a resumable download.
+    """
+    try:
+        return subprocess.run(argv, timeout=timeout).returncode
+    except FileNotFoundError:
+        print(f"{argv[0]!r} not on PATH", file=sys.stderr)
+        return 127
+    except subprocess.TimeoutExpired:
+        print(f"{argv[0]} timed out after {timeout}s", file=sys.stderr)
+        return 124
+
+
 def _git_sha(root: Path) -> str:
     proc = _run(["git", "-C", str(root), "rev-parse", "--short", "HEAD"], timeout=10)
     return proc.stdout.strip() if proc.returncode == 0 else "uncommitted"
@@ -88,8 +106,9 @@ def _build_inputs(s: settings.Settings, args: argparse.Namespace) -> plan_mod.In
     draft = None
     if profiles.get(profile).needs_draft:
         draft = s.get("Q38_DRAFT_MODEL")
-        if s.get("Q38_DRAFT_REVISION"):
-            draft = f"{draft}@{s.get('Q38_DRAFT_REVISION')}"
+    # The revision is its own argument, never "repo@rev": the latter asks
+    # HuggingFace to resolve a repository literally named that. plan.py emits the
+    # dedicated flag and drops the pair when the pin is empty.
     return plan_mod.Inputs(
         model=s.get("Q38_MODEL"),
         served_name=s.get("Q38_SERVED_NAME"),
@@ -104,6 +123,8 @@ def _build_inputs(s: settings.Settings, args: argparse.Namespace) -> plan_mod.In
         profile=profile,
         draft_path=draft,
         draft_model=s.get("Q38_DRAFT_MODEL"),
+        draft_revision=s.get("Q38_DRAFT_REVISION"),
+        model_revision=s.get("Q38_MODEL_REVISION"),
         spec_steps=s.int("Q38_SPEC_STEPS"),
         spec_topk=s.int("Q38_SPEC_TOPK"),
         spec_draft=s.int("Q38_SPEC_DRAFT"),
@@ -304,7 +325,9 @@ def cmd_pull(s: settings.Settings, args: argparse.Namespace) -> int:
               f"re-pinning, then re-run the acceptance benchmarks -- a newer image is\n"
               f"not automatically a faster one on this hardware.", file=sys.stderr)
     if args.pull:
-        return _run(["docker", "pull", s.get("Q38_IMAGE_DIGEST")], timeout=7200).returncode
+        print(f"pulling {s.get('Q38_IMAGE_DIGEST')} "
+              f"(~14 GB compressed; progress below)")
+        return _run_passthrough(["docker", "pull", s.get("Q38_IMAGE_DIGEST")])
     return 0 if live == pinned else 2
 
 

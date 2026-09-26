@@ -25,7 +25,8 @@ def inputs(**over) -> plan_mod.Inputs:
         chunked_prefill=8192,
         mem_fraction=0.621,
         profile="dflash2",
-        draft_path="z-lab/Qwen3.8-27B-DFlash2@50307d4",
+        draft_path="z-lab/Qwen3.8-27B-DFlash2",
+        draft_revision="50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
         cuda_total_gib=119.7,
         cache_dir="/cache",
     )
@@ -93,6 +94,47 @@ class TestSpeculativeShapes(unittest.TestCase):
     def test_ar_profile_has_no_speculative_flags_at_all(self):
         args = plan_mod.build(inputs(profile="ar")).server_args
         self.assertFalse([a for a in args if "speculative" in a])
+
+
+class TestRevisionPins(unittest.TestCase):
+    """Revisions are arguments, never part of a repo id.
+
+    The original implementation folded "repo@50307d4" into --speculative-draft-model-path,
+    which asks HuggingFace to resolve a repository literally named that. It fails
+    during model loading, minutes into a boot, after the weights have downloaded.
+    """
+
+    def test_draft_revision_is_its_own_flag_and_the_path_stays_a_repo_id(self):
+        args = list(plan_mod.build(inputs(profile="dflash2", draft_revision="a" * 40)).server_args)
+        self.assertNotIn("@", args[args.index("--speculative-draft-model-path") + 1])
+        self.assertEqual(args.count("--speculative-draft-model-revision"), 1)
+        self.assertEqual(args[args.index("--speculative-draft-model-revision") + 1], "a" * 40)
+
+    def test_an_empty_draft_revision_drops_the_flag_with_its_value(self):
+        # A dangling --speculative-draft-model-revision followed by the next real
+        # flag would consume it as its argument: a server configured with something
+        # nobody asked for, which is worse than an error.
+        args = list(plan_mod.build(inputs(profile="dflash2", draft_revision="")).server_args)
+        self.assertNotIn("--speculative-draft-model-revision", args)
+        self.assertIn("--speculative-num-draft-tokens", args)
+
+    def test_target_revision_renders_only_when_set(self):
+        without = list(plan_mod.build(inputs(profile="ar")).server_args)
+        self.assertNotIn("--revision", without)
+        with_rev = list(plan_mod.build(inputs(profile="ar", model_revision="deadbeef")).server_args)
+        self.assertEqual(with_rev[with_rev.index("--revision") + 1], "deadbeef")
+
+    def test_shipped_draft_pin_is_a_full_sha(self):
+        # The Hub resolves full shas; the short form is a web UI convenience that
+        # no flag here promises to accept.
+        from qwen38 import settings
+        revision = settings.load().get("Q38_DRAFT_REVISION")
+        self.assertRegex(revision, r"^[0-9a-f]{40}$", revision)
+
+    def test_a_draft_profile_without_a_draft_refuses_before_rendering(self):
+        for name in ("dspark", "dflash2"):
+            with self.assertRaises(SystemExit, msg=name):
+                plan_mod.build(inputs(profile=name, draft_path=None, draft_revision="x" * 40))
 
 
 class TestContextCapability(unittest.TestCase):

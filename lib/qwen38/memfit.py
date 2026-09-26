@@ -112,7 +112,8 @@ def solve(
             clamped=True,
             warnings=(
                 "CUDA pool size not measured; using the configured ceiling "
-                f"{max_fraction}. Run `qwen38 preflight` on the box to measure it.",
+                f"{max_fraction}. Run `qwen38 fit` on the box (without --no-probe) "
+                "to measure the pool through the pinned image.",
             ),
         )
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import shlex
 from dataclasses import dataclass, field
+import re
 
 from . import profiles
 
@@ -32,6 +33,13 @@ class Inputs:
     profile: str
     draft_path: str | None = None
     draft_model: str | None = None
+    # Revisions are their own arguments, never folded into the repo id. Writing
+    # "org/repo@50307d4" asks HuggingFace to resolve a repo literally named that,
+    # which fails at load time -- several minutes and one download into the boot.
+    # Both upstream recipes pin with --speculative-draft-model-revision, and with a
+    # full 40-char sha; a short sha is not something that flag promises to accept.
+    draft_revision: str = ""
+    model_revision: str = ""
     # Speculative knob defaults, chosen to match the measured upstream peaks.
     spec_steps: int = 3
     spec_topk: int = 1
@@ -93,9 +101,42 @@ def _mamba_cache_size(max_concurrent: int, slots_per_request: int) -> int:
     return max_concurrent * slots_per_request
 
 
+# A template that is nothing but one placeholder is a *value slot*. Flag names in
+# these tuples are literals, so flag/value adjacency lets us drop a pair cleanly.
+_VALUE_SLOT = re.compile(r"^\{(\w+)\}$")
+
+
+def _render(flags: tuple[str, ...] | list[str], values: dict[str, str]) -> list[str]:
+    """Format a flag template list, dropping pairs whose value is an empty slot.
+
+    An optional pin that resolves to nothing must take its flag with it. Passing
+    `--speculative-draft-model-revision` with an empty argument is an argparse
+    error at best, and at worst it swallows the next flag as its value and boots a
+    server configured with something nobody asked for.
+    """
+    out: list[str] = []
+    for template in flags:
+        rendered = template.format(**values) if "{" in template else template
+        slot = _VALUE_SLOT.match(template)
+        if slot and rendered == "":
+            if out:
+                out.pop()          # the flag this value belonged to
+            continue
+        out.append(rendered)
+    return out
+
+
 def build(inputs: Inputs) -> Plan:
     profile = profiles.get(inputs.profile)
     profile = profiles.with_context(profile, inputs.context_length)
+
+    # Validated before rendering: a draft profile with no draft model is a
+    # configuration error, not an empty string to be silently dropped.
+    if profile.needs_draft and not inputs.draft_path:
+        raise SystemExit(
+            f"profile {profile.name} needs a draft model. Set Q38_DRAFT_MODEL, or "
+            "use --profile mtp, which drafts from the target's own MTP head."
+        )
 
     values = {
         "chunked_prefill": str(inputs.chunked_prefill),
@@ -113,22 +154,20 @@ def build(inputs: Inputs) -> Plan:
         "dspark_block": str(inputs.dspark_block),
         "dflash_tokens": str(inputs.dflash_tokens),
         "draft_path": inputs.draft_path or "",
+        "draft_revision": inputs.draft_revision or "",
+        "model_revision": inputs.model_revision or "",
     }
 
-    core = [v.format(**values) if "{" in v else v for v in profiles.CORE_FLAGS]
-    spec = [v.format(**values) if "{" in v else v for v in profile.launch_flags()]
+    core = _render(profiles.CORE_FLAGS, values)
+    spec = _render(profile.launch_flags(), values)
 
     missing = [a for a in spec if "{" in a]
     if missing:
         raise SystemExit(f"profile {profile.name} references unset knobs: {missing}")
-    if profile.needs_draft and not inputs.draft_path:
-        raise SystemExit(
-            f"profile {profile.name} needs a draft model. Set Q38_DRAFT_MODEL or run "
-            "with --no-draft to fall back to profile 'mtp'."
-        )
 
     server_args = [
         "--model-path", inputs.model,
+        *_render(["--revision", "{model_revision}"], values),
         *core,
         *spec,
         *inputs.extra_server_args,

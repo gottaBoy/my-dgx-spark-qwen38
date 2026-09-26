@@ -104,6 +104,7 @@ PROFILES: dict[str, Profile] = {
         spec_flags=(
             "--speculative-algorithm", "DSPARK",
             "--speculative-draft-model-path", "{draft_path}",
+            "--speculative-draft-model-revision", "{draft_revision}",
             "--speculative-dspark-block-size", "{dspark_block}",
             "--speculative-draft-model-quantization", "unquant",
         ),
@@ -116,6 +117,7 @@ PROFILES: dict[str, Profile] = {
         spec_flags=(
             "--speculative-algorithm", "DFLASH",
             "--speculative-draft-model-path", "{draft_path}",
+            "--speculative-draft-model-revision", "{draft_revision}",
             "--speculative-num-draft-tokens", "{dflash_tokens}",
         ),
         # DFLASH rejects extra_buffer_lazy on the image we pin (upstream #34763
