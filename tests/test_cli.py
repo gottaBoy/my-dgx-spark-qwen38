@@ -12,6 +12,7 @@ import importlib.util
 import io
 import os
 import re
+import socket
 import unittest
 import urllib.request
 from pathlib import Path
@@ -49,6 +50,30 @@ def run_cli(*argv) -> tuple[int, str, str]:
         if exc.code and isinstance(exc.code, str):
             err.write(exc.code)
     return code, out.getvalue(), err.getvalue()
+
+
+@contextlib.contextmanager
+def closed_port_in_env():
+    """Point Q38_PORT at a port nothing is listening on, for the duration.
+
+    These tests assert what the CLI says when the engine is *not* there. They used
+    to rely on the shipped default being free, which held right up until the engine
+    was started on this box and then failed three tests for a reason that had
+    nothing to do with the code under test. Bind a port, read the number, release
+    it: the kernel will not hand it to anyone else in the microseconds we use it.
+    """
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    saved = os.environ.get("Q38_PORT")
+    os.environ["Q38_PORT"] = str(port)
+    try:
+        yield port
+    finally:
+        if saved is None:
+            os.environ.pop("Q38_PORT", None)
+        else:
+            os.environ["Q38_PORT"] = saved
 
 
 class TestTuneProtocolIsExecutable(unittest.TestCase):
@@ -117,12 +142,14 @@ class TestRefusals(unittest.TestCase):
             self.assertIn(name, err)
 
     def test_bench_against_no_engine_fails_clearly(self):
-        code, _out, err = run_cli("bench", "--probe", "code")
+        with closed_port_in_env():
+            code, _out, err = run_cli("bench", "--probe", "code")
         self.assertEqual(code, 1)
         self.assertIn("unreachable", err + _out)
 
     def test_metrics_against_no_engine_says_so(self):
-        code, _out, err = run_cli("metrics")
+        with closed_port_in_env():
+            code, _out, err = run_cli("metrics")
         self.assertEqual(code, 1)
         self.assertIn("unreachable", err + _out)
 
@@ -320,7 +347,8 @@ class TestHealthProbesDoNotLie(unittest.TestCase):
         # An OSConnectionError must land in the "unreachable" branch; the 502
         # above arrived as HTTPError, which is a different exception class and
         # used to escape cmd_bench's handler entirely.
-        code, _out, err = run_cli("canary")
+        with closed_port_in_env():
+            code, _out, err = run_cli("canary")
         self.assertEqual(code, 1)
         self.assertIn("FAIL", _out + err)
 

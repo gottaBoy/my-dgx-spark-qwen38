@@ -32,6 +32,33 @@ def repo_dir_name(repo: str) -> str:
     return "models--" + _SAFE_REPO.sub("--", repo.replace("/", "--"))
 
 
+def write_ref_alias(hf_home: Path | str, repo: str, revision: str,
+                    aliases: tuple[str, ...] = ("main",)) -> list[Path]:
+    """Give a pinned snapshot the branch names it is missing.
+
+    Why this is needed: prefetch downloads by full sha, which creates
+    snapshots/<sha>/ but leaves refs/ empty. transformers then resolves a repo
+    with no explicit revision through refs/<branch>, finds nothing, falls back to
+    a network call -- and in offline mode that call is refused. Verified here:
+    both repos read fine by sha and both raise OSError by branch name.
+
+    SGLang reads the *draft* config internally without passing our revision flag,
+    so we cannot fix this from the command line. Recording the alias is the honest
+    fix: the snapshot really is main, so naming it is not a fabrication.
+    """
+    root = Path(hf_home) / "hub" / repo_dir_name(repo)
+    refs = root / "refs"
+    refs.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for alias in aliases:
+        path = refs / alias
+        if path.is_file() and path.read_text(encoding="utf-8").strip() == revision:
+            continue
+        path.write_text(revision, encoding="utf-8")
+        written.append(path)
+    return written
+
+
 def snapshot_dir(hf_home: Path | str, repo: str, revision: str) -> Path:
     """The directory the container resolves for repo@revision.
 

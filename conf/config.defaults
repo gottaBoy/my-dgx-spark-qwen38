@@ -18,6 +18,15 @@ Q38_STATE_DIR="state"
 # Weights and compile caches stay OUT of the worktree: a 24 GB checkpoint does
 # not belong in a git tree, and this box had no ~/.cache/huggingface at all.
 Q38_CACHE_DIR="~/.cache/qwen38-spark"
+# --- offline weight resolution -------------------------------------------------
+# 1 = tell the engine not to touch the Hub at boot. On the reference box this is
+# not an optimisation, it is the only thing that works: DNS there resolves
+# huggingface.co to a blocked address, so an online boot hangs in connect() and
+# burns CPU on retries forever (measured: 8 CPU-seconds in 10 minutes, no socket
+# progress). With offline on, a missing file fails in seconds with a named file
+# instead of hanging -- which is the behaviour you want from a serving engine.
+# Requires `qwen38 prefetch` to have completed; doctor checks that.
+Q38_OFFLINE="1"
 
 # --- ports -------------------------------------------------------------------
 # WHY not 30000/8888: this box already publishes 30000 (ibiz-ebsx-allinone),

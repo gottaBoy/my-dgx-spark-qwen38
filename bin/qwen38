@@ -150,6 +150,7 @@ def _build_inputs(s: settings.Settings, args: argparse.Namespace) -> plan_mod.In
         shm_size=s.get("Q38_SHM_SIZE"),
         privileged=s.flag("Q38_PRIVILEGED"),
         cache_dir=str(s.cache_dir),
+        offline=s.flag("Q38_OFFLINE"),
         extra_server_args=s.wordlist("Q38_EXTRA_SERVER_ARGS"),
         extra_docker_args=s.wordlist("Q38_EXTRA_DOCKER_ARGS"),
         cuda_total_gib=cuda_total,
@@ -162,7 +163,26 @@ def _api(port: int, path: str, payload: dict | None = None, timeout: float = 30.
     req = urllib.request.Request(url, data=data,
                                  headers={"Content-Type": "application/json"} if data else {})
     with net.local_opener().open(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+        body = resp.read()
+    # SGLang's /health answers 200 with an empty body, which is not malformed --
+    # it is the documented shape. Returning None for it beats raising, because the
+    # caller usually only wanted to know that the port answered.
+    return json.loads(body) if body.strip() else None
+
+
+def _http_ok(port: int, path: str = "/health", timeout: float = 5.0) -> bool:
+    """Did the engine answer this route with a 2xx? Status only, no parsing.
+
+    Readiness is a question about the socket, not about a payload. Parsing first
+    meant an empty-body /health raised JSONDecodeError straight through wait's
+    `except (URLError, OSError)` -- so a healthy, serving engine crashed the
+    command meant to report it ready.
+    """
+    try:
+        with net.local_opener().open(f"http://127.0.0.1:{port}{path}", timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
 
 
 def _ledger(s: settings.Settings) -> evidence.Ledger:
@@ -290,7 +310,17 @@ def cmd_fit(s: settings.Settings, args: argparse.Namespace) -> int:
 
 
 def docker_present(s: settings.Settings) -> bool:
-    return _run(["docker", "images", "-q", s.get("Q38_IMAGE_DIGEST")], timeout=60).stdout.strip() != ""
+    """Can the daemon run our pinned reference right now?
+
+    `docker images -q <digest>` returns nothing even when the image is present and
+    runnable by that exact digest -- it matches the tag column, and a loaded image
+    carries the digest in RepoDigests rather than as a listable reference. Measured
+    on this box: `-q` empty, `run` fine. Asking inspect and reading the exit code is
+    the only form that agrees with what `docker run` will actually do, and getting
+    this wrong makes `start` refuse a boot it could have completed.
+    """
+    return _run(["docker", "image", "inspect", "--format", "{{.Id}}",
+                 s.get("Q38_IMAGE_DIGEST")], timeout=60).returncode == 0
 
 
 def cmd_plan(s: settings.Settings, args: argparse.Namespace) -> int:
@@ -476,6 +506,15 @@ def cmd_prefetch(s: settings.Settings, args: argparse.Namespace) -> int:
         (already if state.present else todo).append((repo, revision, state))
     for repo, _rev, state in already:
         print(f"  cached  {repo}  {state.gib} GiB ({state.reason})")
+
+    # Aliases are written for what is already on disk too, not only for what gets
+    # fetched now: a cache that predates this fix is otherwise stuck needing a
+    # re-download to become usable offline.
+    for repo, revision, state in already:
+        if state.present:
+            for path in hfcache.write_ref_alias(hf_home, repo, revision):
+                print(f"  alias   {repo} -> {path.parent.name}/{path.name}")
+
     if not todo:
         print("nothing to fetch.")
         return 0
@@ -508,6 +547,8 @@ def cmd_prefetch(s: settings.Settings, args: argparse.Namespace) -> int:
     ok = True
     for repo, revision, _state in todo:
         state = hfcache.inspect_repo(hf_home, repo, revision)
+        if state.present:
+            hfcache.write_ref_alias(hf_home, repo, revision)
         print(f"  {'PASS' if state.present else 'FAIL'} {repo}  {state.gib} GiB  {state.reason}")
         ok = ok and state.present
     return 0 if ok else 1
@@ -661,9 +702,10 @@ def cmd_wait(args: argparse.Namespace, *, settings: settings.Settings | None = N
                 ledger.append(run_id, status="failed", event={"kind": "exited", "log_tail": tail[-2000:]})
             print("container exited before becoming ready; last 60 log lines:\n" + tail, file=sys.stderr)
             return 1
-        try:
-            _api(port, "/health", timeout=5)
-        except (urllib.error.URLError, OSError):
+        # Status only. The old form parsed /health's body, and SGLang answers that
+        # route with 200 and zero bytes, so a JSONDecodeError escaped the except
+        # below and killed wait against a fully healthy engine.
+        if not _http_ok(port):
             time.sleep(5)
             continue
         elapsed = round(time.time() - started)

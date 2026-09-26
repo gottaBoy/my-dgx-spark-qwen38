@@ -51,6 +51,10 @@ class Inputs:
     shm_size: str = "16g"
     privileged: bool = False
     cache_dir: str = ""
+    # Refuse Hub lookups at boot. On a box where DNS poisons huggingface.co, an
+    # online boot hangs in connect() forever (measured: 8 CPU-seconds in 10
+    # minutes) while offline fails in seconds and names the missing file.
+    offline: bool = False
     extra_server_args: tuple[str, ...] = ()
     extra_docker_args: tuple[str, ...] = ()
     # Measured CUDA pool, in GiB. Zero when it could not be measured, which
@@ -216,6 +220,12 @@ def build(inputs: Inputs) -> Plan:
         "-e", "HF_HOME=/root/.cache/huggingface",
         "-e", "TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor",
         "-e", "TRITON_CACHE_DIR=/root/.triton",
+        # HF_HUB_OFFLINE is the one that matters here: it makes a cache miss an
+        # immediate LocalEntryNotFoundError instead of a network attempt. It is
+        # deliberately not TRANSFORMERS_OFFLINE too -- that flag is a broader
+        # hammer other libraries read differently, and one lever that is well
+        # understood beats two that are not.
+        *(["-e", "HF_HUB_OFFLINE=1"] if inputs.offline else []),
         "-v", f"{inputs.cache_dir}/huggingface:/root/.cache/huggingface",
         "-v", f"{inputs.cache_dir}/triton:/root/.triton",
         "-v", f"{inputs.cache_dir}/inductor:/root/.cache/inductor",

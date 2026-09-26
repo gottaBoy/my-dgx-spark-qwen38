@@ -81,16 +81,43 @@ class TestChoose(unittest.TestCase):
         self.assertEqual(probes, [])
 
     def test_shipped_ports_clear_this_box(self):
-        # The claim in conf/config.defaults, made testable: our defaults must be
-        # both free right now and below the ephemeral floor.
+        """The shipped defaults must be sound as *configuration*, not as a snapshot.
+
+        This test used to assert the ports were free at this instant. That is a
+        property of the moment, not of the file: it passed on an idle box and
+        failed the first time the engine was actually deployed on it -- a test
+        that breaks when the thing it describes succeeds. Whether anything is
+        listening is checked at launch by `ports.choose`, which is where that fact
+        belongs. What stays here are the invariants a config file can be wrong about
+        on its own.
+        """
         from qwen38 import settings
         loaded = settings.load()
         floor = ports.ephemeral_floor()
-        for key in ("Q38_PORT", "Q38_STATUS_PORT"):
-            port = loaded.int(key)
-            self.assertTrue(ports.is_free(port), f"{key}={port} is taken")
+        shipped = {key: loaded.int(key) for key in ("Q38_PORT", "Q38_STATUS_PORT")}
+        self.assertEqual(len(set(shipped.values())), 2, shipped)
+        for key, port in shipped.items():
+            # Below 1024 needs root to bind, which this stack never assumes.
+            self.assertGreaterEqual(port, 1024, key)
             if floor:
+                # Inside the ephemeral range, the kernel can hand this port to any
+                # outgoing connection on the box and our listener loses it.
                 self.assertLess(port, floor, f"{key}={port} is inside the ephemeral range")
+            # The neighbours that were here before this repo, taken from the box's
+            # own published ports. Date-stamped on purpose: this list needs a
+            # conscious edit when the machine changes, which is the point.
+            self.assertNotIn(port, {30000, 30086, 30088, 30250, 30251,
+                                    32002, 32003, 32666}, f"{key} collides")
+
+    def test_launch_still_probes_before_claiming_a_port(self):
+        # The other half of the previous test, in the place it belongs: choose()
+        # must not hand back a port something is already holding.
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            taken = listener.getsockname()[1]
+            chosen, _probes = ports.choose([taken])
+        self.assertNotEqual(chosen, taken)
 
 
 class TestLedger(unittest.TestCase):
