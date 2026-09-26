@@ -176,13 +176,25 @@ class TestGdnPool(unittest.TestCase):
 
 class TestBudgetNote(unittest.TestCase):
     def test_a_budget_too_small_for_one_full_sequence_is_said_out_loud(self):
-        # fraction 0.45 of 119.7 = 53.9 GiB; weights ~26.6 + 262144-token
-        # sequence ~8.2 fits, so this asserts the ok branch...
+        # The default boot fits, and says so with the arithmetic attached.
         built = plan_mod.build(inputs())
-        self.assertTrue(any("budget" in n for n in built.notes), built.notes)
-        # ...and this asserts the short branch, at 1M context.
-        tight = plan_mod.build(inputs(profile="mtp", context_length=1000000, mem_fraction=0.45))
+        self.assertTrue(any("budget ok" in n for n in built.notes), built.notes)
+
+    def test_a_budget_below_weights_plus_one_sequence_is_flagged(self):
+        # 0.20 of 119.7 = 23.9 GiB, which does not even leave the 22.1 GiB of
+        # weights any room for a KV cache. The fraction is chosen far from the
+        # boundary on purpose: an earlier version of this test pinned 0.45 with
+        # estimated weights and flipped to "ok" the moment the weights were
+        # replaced with Hub-measured values, which is a test that was asserting
+        # its own arithmetic rather than the behaviour.
+        tight = plan_mod.build(inputs(profile="mtp", context_length=1000000, mem_fraction=0.20))
         self.assertTrue(any("BUDGET SHORT" in n for n in tight.notes), tight.notes)
+
+    def test_the_short_message_carries_the_numbers_that_produced_it(self):
+        tight = plan_mod.build(inputs(profile="mtp", context_length=1000000, mem_fraction=0.20))
+        note = next(n for n in tight.notes if "BUDGET SHORT" in n)
+        for fragment in ("0.2", "119.7", "1000000"):
+            self.assertIn(fragment, note, note)
 
     def test_budget_check_is_silent_when_the_pool_was_never_measured(self):
         # Without a denominator the arithmetic is meaningless; claiming a budget

@@ -42,10 +42,19 @@ class Profile:
     # clamps --max-running-requests, which is the worse failure. This is a sweep
     # knob -- record what the boot actually granted, do not trust this number.
     mamba_slots: int = 4
-    # Rough static-weight footprint (GiB) used only for sanity-checking the
-    # fitted fraction before we spend 8 minutes booting.
-    approx_weight_gib: float = 24.0
+    # Static weight footprint in GiB, used to sanity-check the fitted fraction
+    # before an 8-minute boot. These are Hub-measured (usedStorage), not
+    # estimates: target 22.13, DFlash2 draft 3.58, DSpark draft 5.99. The
+    # previous values were guesses and were wrong in both directions -- DSpark
+    # was under-stated by more than 3 GiB, which is the one direction that makes
+    # a budget check pass when it should warn. Re-check with `verify-pins`.
+    approx_weight_gib: float = 22.1
     needs_draft: bool = False
+    # The architecture a correct draft declares in its config.json. Checked
+    # against the Hub by `verify-pins`, because a draft of the wrong packaging
+    # loads and serves while being silently wrong -- r0b0tlab warn specifically
+    # about the vLLM Qwen3DSparkModel build for this reason.
+    draft_arch: str = ""
 
     def launch_flags(self) -> list[str]:
         return list(self.spec_flags) + list(self.extra_flags)
@@ -74,6 +83,13 @@ CORE_FLAGS: tuple[str, ...] = (
     "--port", "{port}",
     "--served-model-name", "{served_name}",
 )
+
+# The architecture every Qwen3.8-27B export declares, checked against the Hub by
+# `verify-pins`. Verified identical across four exports on 2026-09-26: the bf16
+# base, Qwen's own FP8, and both RadixArk NVFP4 exports. That is what makes one
+# constant correct for the family; a repackaged checkpoint under the same name
+# fails here instead of booting, serving, and being quietly wrong.
+TARGET_ARCH = "Qwen3_5ForConditionalGeneration"
 
 PROFILES: dict[str, Profile] = {
     # No drafter at all. The reference every other number is compared against,
@@ -109,7 +125,8 @@ PROFILES: dict[str, Profile] = {
             "--speculative-draft-model-quantization", "unquant",
         ),
         needs_draft=True,
-        approx_weight_gib=26.7,
+        approx_weight_gib=28.12,       # 22.13 target + 5.99 DSpark draft
+        draft_arch="DSparkDraftModel",
     ),
     "dflash2": Profile(
         name="dflash2",
@@ -124,7 +141,8 @@ PROFILES: dict[str, Profile] = {
         # adds it; untested here), so it asks for the plain buffer strategy.
         mamba_strategy="extra_buffer",
         needs_draft=True,
-        approx_weight_gib=26.6,
+        approx_weight_gib=25.71,       # 22.13 target + 3.58 DFlash2 draft
+        draft_arch="DFlash2DraftModel",
     ),
 }
 

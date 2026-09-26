@@ -27,7 +27,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 from qwen38 import cpuset as cpuset_mod
 from qwen38 import (evidence, guard, memfit, plan as plan_mod, ports, profiles,
-                    settings, settle)
+                    hfcache, imageport, net, pins, settings, settle)
+
+# The download itself needs huggingface_hub, which is not stdlib and so is not a
+# dependency of this CLI. Two candidate interpreters are probed rather than
+# assumed: the one running this process, and a project .venv. Rolling our own
+# writer for the Hub cache layout was considered and rejected -- blob names come
+# from the Hub's own metadata, and getting one subtly wrong produces a cache that
+# looks populated and fails at load, which is the failure this whole module is
+# here to prevent.
+HUB_IMPORT_PROBE = "import huggingface_hub, sys; print(huggingface_hub.__version__)"
+
+# Candidate interpreters for the prefetch, in order. The CLI itself is stdlib-only
+# and stays that way; huggingface_hub is a tool dependency of this one command,
+# which is why it is probed for rather than imported. A project .venv is checked
+# first because that is where it is usually installed by hand.
+HUB_INTERPRETERS = (".venv/bin/python", sys.executable, "python3")
 
 CONTAINER = "qwen38-spark"
 PROBE_TIMEOUT_S = 600
@@ -84,7 +99,7 @@ def _cuda_total_gib(s: settings.Settings, timeout: int) -> tuple[float | None, s
     that had never pulled the image.
     """
     if not docker_present(s):
-        return None, "image not pulled; run `qwen38 pull --pull` first"
+        return None, "image not local; run `qwen38 fetch-image` first"
     proc = _run(["docker", "run", "--rm", "--gpus", "all", s.get("Q38_IMAGE_DIGEST"),
                  "python3", "-c", memfit.MEASURE_CUDA_TOTAL], timeout=max(timeout, 120))
     if proc.returncode != 0:
@@ -146,22 +161,8 @@ def _api(port: int, path: str, payload: dict | None = None, timeout: float = 30.
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data,
                                  headers={"Content-Type": "application/json"} if data else {})
-    with _direct_opener().open(req, timeout=timeout) as resp:
+    with net.local_opener().open(req, timeout=timeout) as resp:
         return json.loads(resp.read())
-
-
-def _direct_opener() -> urllib.request.OpenerDirector:
-    """An opener that never consults the proxy environment.
-
-    This box sets HTTP_PROXY for outbound traffic and lists `127.*` in no_proxy.
-    Python does not treat that as a wildcard -- it matches no_proxy entries by
-    suffix -- so `127.*` does not bypass `127.0.0.1`, and every request to the
-    local engine goes to the proxy instead. The symptom is a 502 against a
-    perfectly healthy server, which reads as "engine unreachable" and would send
-    you debugging the engine. A loopback API is never reached through a proxy,
-    so we say so rather than depending on the operator's no_proxy spelling.
-    """
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _ledger(s: settings.Settings) -> evidence.Ledger:
@@ -193,7 +194,8 @@ def cmd_doctor(s: settings.Settings, args: argparse.Namespace) -> int:
         # would make install.sh unrunnable on the fresh box it is meant for.
         checks.append(("pinned image present", "PASS" if have_image else "WARN",
                        s.get("Q38_IMAGE_DIGEST")[:60]
-                       + ("" if have_image else " -- run: qwen38 pull --pull")))
+                       + ("" if have_image
+                          else " -- run: qwen38 fetch-image (see its --print-size)")))
 
     proc = _run(["nvidia-smi", "-L"], timeout=30)
     gpu_ok = proc.returncode == 0 and "GPU" in proc.stdout
@@ -230,6 +232,19 @@ def cmd_doctor(s: settings.Settings, args: argparse.Namespace) -> int:
         stat = os.statvfs(parent)
         free_gib = stat.f_bavail * stat.f_frsize / 1024**3
     add(f"cache disk >= {need_gib} GiB", free_gib >= need_gib, f"{free_gib:.0f} GiB free at {cache}")
+
+    # Weights, checked by the layout the container will actually resolve. Disk
+    # space says you *could* store them; this says they are *there*. A boot with
+    # absent weights does not fail fast -- it retries a download from a host the
+    # container cannot reach, which looks like a slow start for about an hour.
+    active = profiles.get(s.get("Q38_PROFILE"))
+    for repo, revision in hfcache.required_repos(s, active):
+        state = hfcache.inspect_repo(s.cache_dir / "huggingface", repo, revision)
+        label = f"weights {repo.split('/')[-1][:24]}"
+        if state.present:
+            add(label, True, f"{state.gib} GiB cached -- {state.reason}")
+        else:
+            checks.append((label, "WARN", f"{state.reason}  [run: qwen38 prefetch]"))
 
     proc = _run(["systemctl", "is-active", "systemd-oomd", "earlyoom"], timeout=15)
     # Field-wise, not substring: "active" is inside "inactive", so a substring
@@ -325,10 +340,177 @@ def cmd_pull(s: settings.Settings, args: argparse.Namespace) -> int:
               f"re-pinning, then re-run the acceptance benchmarks -- a newer image is\n"
               f"not automatically a faster one on this hardware.", file=sys.stderr)
     if args.pull:
-        print(f"pulling {s.get('Q38_IMAGE_DIGEST')} "
-              f"(~14 GB compressed; progress below)")
+        print(f"pulling {s.get('Q38_IMAGE_DIGEST')} (~14 GB compressed; progress below)")
         return _run_passthrough(["docker", "pull", s.get("Q38_IMAGE_DIGEST")])
     return 0 if live == pinned else 2
+
+
+def cmd_fetch_image(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Bring the pinned image in without needing dockerd to have a proxy.
+
+    Why this exists next to `pull --pull`: on this box dockerd carries no proxy and
+    the registry is only reachable through one, so `docker pull` of the engine image
+    stalled at 59 KiB/s. Reconfiguring dockerd would restart every container on the
+    machine, including workloads that are not ours. A registry client that does
+    honour HTTP_PROXY writes a tarball, and `docker load` reads it from disk --
+    dockerd never needs the network.
+    """
+    ref = s.get("Q38_IMAGE_DIGEST")
+    tool = imageport.find_tool(args.tool,
+                               extra_dirs=(str(imageport.default_tool_dir(s.cache_dir)),))
+    if tool is None:
+        print("No registry client found. Options:\n"
+              f"  - drop a crane binary in {imageport.default_tool_dir(s.cache_dir)}\n"
+              "  - apt-get install skopeo\n"
+              "  - pass --tool /path/to/crane", file=sys.stderr)
+        return 1
+    if not (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")):
+        print("WARNING: no HTTPS_PROXY set. If this box reaches the registry only "
+              "through a proxy, this will stall exactly like `docker pull`.",
+              file=sys.stderr)
+
+    # The alias tag is what a registry client will resolve; a digest reference is
+    # not reliably accepted. The digest is verified afterwards, which is the whole
+    # point of pinning it in the first place.
+    target = s.get("Q38_IMAGE_ALIAS")
+
+    if args.print_size:
+        proc = _run([tool.path, "manifest", "--platform", imageport.DOCKER_PLATFORM, target],
+                    timeout=180)
+        total = imageport.expected_bytes(proc.stdout)
+        if not total:
+            print(f"could not read the manifest: {proc.stderr.strip()[:200]}", file=sys.stderr)
+            return 1
+        print(f"{total / 2**30:.2f} GiB compressed, {imageport.DOCKER_PLATFORM} only, via {tool.name}")
+        return 0
+
+    dest = s.cache_dir / f"image-{imageport.digest_of(ref)[-12:] or 'unpinned'}.tar"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if dest.exists() and dest.stat().st_size:
+        print(f"reusing {dest} ({dest.stat().st_size // 2**30} GiB on disk)")
+    else:
+        print(f"fetching {target} for {imageport.DOCKER_PLATFORM} -> {dest}")
+        print("(per-layer progress; a large layer can sit for a while)")
+        code = _run_passthrough(imageport.pull_argv(tool, target, dest), timeout=args.timeout)
+        if code != 0:
+            print(f"registry fetch failed ({code}). Re-run to continue from what landed.",
+                  file=sys.stderr)
+            return code
+
+    print("loading into docker (reads the archive; dockerd needs no network for this)")
+    # --platform as a second belt: a mis-fetched index must not become a set of
+    # layers this hardware cannot execute.
+    code = _run_passthrough([*imageport.load_argv(), "--platform",
+                             imageport.DOCKER_PLATFORM, "-i", str(dest)], timeout=args.timeout)
+    if code != 0:
+        print(f"docker load failed ({code})", file=sys.stderr)
+        return code
+
+    if not docker_present(s):
+        print("\nloaded, but the digest we pinned is not what docker now resolves.\n"
+              "The tag moved. Check with: qwen38 pull", file=sys.stderr)
+        return 2
+    print(f"OK: {ref} is present locally.")
+    print(f"Reclaim the archive when you are done with it:\n  rm {dest}")
+    return 0
+
+
+def cmd_verify_pins(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Check that the pinned repos resolve, and still are what we think they are."""
+    profile = profiles.get(args.profile or s.get("Q38_PROFILE"))
+    checks = pins.verify_all(s, profile)
+    width = max(len(c.role) for c in checks) + 1
+    for check in checks:
+        print(f"  {check.status:4s} {check.role:<{width}s} {check.repo}")
+        print(f"         {'':<{width}s} {check.detail}")
+    passed, warned, failed = pins.summarise(checks)
+    print(f"\n{passed} pass, {warned} warn, {failed} fail")
+    if failed:
+        print("A FAIL here means the boot will fail too, later and more expensively.",
+              file=sys.stderr)
+    return 1 if failed else 0
+
+
+def _hub_interpreter(s: settings.Settings) -> str | None:
+    """First interpreter that can import huggingface_hub, or None."""
+    for candidate in HUB_INTERPRETERS:
+        argv = [str(s.root / candidate)] if candidate.startswith(".") else [candidate]
+        proc = _run([*argv, "-c", HUB_IMPORT_PROBE], timeout=30)
+        if proc.returncode == 0:
+            return argv[0]
+    return None
+
+
+def cmd_prefetch(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Download the weights on the host, into the layout the container reads.
+
+    This exists because the container cannot fetch its own weights here: it has no
+    route to huggingface.co (measured from inside a container: connection timeout),
+    and dockerd on this box carries no proxy. `docker run` without this step does
+    not fail -- it retries an impossible download and looks like a very slow boot.
+
+    HF_HOME is exported rather than passing cache_dir= to the downloader. The two
+    produce different layouts: HF_HOME resolves to $HF_HOME/hub/<repo>, while
+    cache_dir= writes <dir>/<repo> with no hub/ level, and the container only ever
+    reads the first. That mismatch is what made 10 GiB of weights invisible the
+    first time this was tried.
+    """
+    profile = profiles.get(args.profile or s.get("Q38_PROFILE"))
+    wanted = hfcache.required_repos(s, profile)
+
+    interpreter = _hub_interpreter(s)
+    if interpreter is None:
+        print("prefetch needs huggingface_hub, which this CLI does not carry.\n"
+              "  python3 -m venv .venv && .venv/bin/pip install 'huggingface_hub'\n"
+              f"then re-run: bin/qwen38 prefetch --profile {profile.name}", file=sys.stderr)
+        return 1
+
+    hf_home = s.cache_dir / "huggingface"
+    hf_home.mkdir(parents=True, exist_ok=True)
+
+    already = []
+    todo = []
+    for repo, revision in wanted:
+        state = hfcache.inspect_repo(hf_home, repo, revision)
+        (already if state.present else todo).append((repo, revision, state))
+    for repo, _rev, state in already:
+        print(f"  cached  {repo}  {state.gib} GiB ({state.reason})")
+    if not todo:
+        print("nothing to fetch.")
+        return 0
+
+    print(f"  fetching {len(todo)} repo(s) into {hf_home}")
+    print("  a proxy is required on this box; HTTP_PROXY/HTTPS_PROXY are passed through\n")
+
+    script = (
+        "from huggingface_hub import snapshot_download\n"
+        "import sys\n"
+        f"targets = {todo!r}\n"
+        "for repo, rev, _state in targets:\n"
+        "    print(f'[fetch] {{repo}} @ {{rev[:12]}}', flush=True)\n"
+        "    snapshot_download(repo, revision=rev, max_workers=4)\n"
+        "    print(f'[fetch] done {{repo}}', flush=True)\n"
+    )
+    env = dict(os.environ, HF_HOME=str(hf_home))
+    try:
+        completed = subprocess.run([interpreter, "-c", script], env=env, timeout=None)
+    except KeyboardInterrupt:
+        print("\ninterrupted. Partial blobs are kept on disk; re-run to resume rather "
+              "than restart -- the Hub client picks up where it stopped.", file=sys.stderr)
+        return 130
+    if completed.returncode != 0:
+        print(f"prefetch failed ({completed.returncode}). Verify the proxy and re-run; "
+              "incomplete files resume rather than restart.", file=sys.stderr)
+        return completed.returncode
+
+    print()
+    ok = True
+    for repo, revision, _state in todo:
+        state = hfcache.inspect_repo(hf_home, repo, revision)
+        print(f"  {'PASS' if state.present else 'FAIL'} {repo}  {state.gib} GiB  {state.reason}")
+        ok = ok and state.present
+    return 0 if ok else 1
 
 
 def cmd_start(s: settings.Settings, args: argparse.Namespace) -> int:
@@ -345,9 +527,12 @@ def cmd_start(s: settings.Settings, args: argparse.Namespace) -> int:
     if not args.allow_pull and not docker_present(s):
         print(f"REFUSED: the pinned image is not present locally.\n"
               f"  {s.get('Q38_IMAGE_DIGEST')}\n"
-              f"Pull it deliberately with `qwen38 pull --pull` (check the disk free in\n"
-              f"`qwen38 doctor` first), or pass --allow-pull to let start do it.",
-              file=sys.stderr)
+              f"Fetch it deliberately, with one of:\n"
+              f"  qwen38 fetch-image   # proxy-aware client + docker load; works when\n"
+              f"                         dockerd has no proxy, as on this box\n"
+              f"  qwen38 pull --pull   # plain docker pull; only if dockerd itself can\n"
+              f"                         reach the registry (check `qwen38 doctor` disk)\n"
+              f"Or pass --allow-pull to let start pull it inline.", file=sys.stderr)
         return 3
 
     sample = guard.read_sample()
@@ -604,7 +789,7 @@ def cmd_metrics(s: settings.Settings, args: argparse.Namespace) -> int:
     """
     port = s.int("Q38_PORT")
     try:
-        raw = _direct_opener().open(f"http://127.0.0.1:{port}/metrics", timeout=15).read().decode()
+        raw = net.local_opener().open(f"http://127.0.0.1:{port}/metrics", timeout=15).read().decode()
     except (urllib.error.URLError, OSError) as exc:
         print(f"engine unreachable on :{port}: {exc}", file=sys.stderr)
         return 1
@@ -682,7 +867,7 @@ def cmd_observe(s: settings.Settings, args: argparse.Namespace) -> int:
             else:
                 row["container"] = "not running"
             try:
-                raw = _direct_opener().open(
+                raw = net.local_opener().open(
                     f"http://127.0.0.1:{s.int('Q38_PORT')}/metrics", timeout=5).read().decode()
                 row.update(_parse_metrics(raw))
             except (urllib.error.URLError, OSError):
@@ -1084,6 +1269,23 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pull", help="check the image pin, optionally pull it")
     p.add_argument("--pull", action="store_true")
     p.set_defaults(func=cmd_pull)
+
+    p = sub.add_parser("fetch-image",
+                       help="bring the image in via a proxy-aware client, then docker load")
+    p.add_argument("--tool", default="", help="path or name of crane/skopeo")
+    p.add_argument("--timeout", type=int, default=21600)
+    p.add_argument("--print-size", action="store_true", dest="print_size",
+                   help="report the arm64 download size and exit")
+    p.set_defaults(func=cmd_fetch_image)
+
+    p = sub.add_parser("verify-pins",
+                       help="check the model/draft pins resolve over the network (~5s)")
+    p.add_argument("--profile", choices=sorted(profiles.PROFILES))
+    p.set_defaults(func=cmd_verify_pins)
+
+    p = sub.add_parser("prefetch", help="download weights on the host (the container cannot)")
+    p.add_argument("--profile", choices=sorted(profiles.PROFILES))
+    p.set_defaults(func=cmd_prefetch)
 
     p = sub.add_parser("start", help="fit, check, launch, record")
     p.add_argument("--profile", choices=sorted(profiles.PROFILES))

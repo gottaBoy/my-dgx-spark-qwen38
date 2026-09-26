@@ -9,6 +9,9 @@ state/
 
 __pycache__/
 *.pyc
+# Host-side prefetch tooling (huggingface_hub is not stdlib, and the CLI must
+# stay runnable without it).
+.venv/
 
 # Leftovers from an interrupted run.
 *.tmp

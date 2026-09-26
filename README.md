@@ -44,13 +44,22 @@ state/              logs, the run ledger, watch records (gitignored)
 git clone <this repo> && cd my-dgx-spark-qwen38
 ./install.sh --print-unit     # inspect what would be written, change nothing
 ./install.sh                  # render + enable the unit (starts nothing)
-./bin/qwen38 pull --pull      # ~14 GB image, a deliberate step
-sudo systemctl start qwen38-spark    # 7-9 min boot, plus ~24 GB of weights first
+./bin/qwen38 fetch-image      # the engine image, 13.41 GiB compressed
+./bin/qwen38 prefetch         # 25.72 GiB of weights, on the host
+sudo systemctl start qwen38-spark     # 7-9 min boot
 ./bin/qwen38 canary && ./bin/qwen38 bench --save
 ```
 
 `install.sh` never pulls an image and never downloads weights. Those are big,
 visible, disk-consuming decisions and each has its own command.
+
+`fetch-image` exists because `docker pull` does not work on the reference box:
+dockerd carries no proxy, this network reaches the registry only through one, and
+the pull stalled at 59 KiB/s. Reconfiguring dockerd would restart the 24
+containers already running here, so the image arrives by registry client plus
+`docker load` instead. `prefetch` exists for the same reason one level down: a
+container here cannot reach huggingface.co at all (measured: connection timeout),
+so weights that "download on first boot" never finish downloading.
 
 ## Reading
 

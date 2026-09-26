@@ -7,8 +7,8 @@
 #   ./install.sh --print-unit     # render the unit and exit; touches nothing
 #
 # What this does and does not do:
-#   * it never downloads weights and never pulls an image. Those are big,
-#     visible decisions -- ./bin/qwen38 pull --pull is the command for that, so
+#   * it never downloads weights and never pulls an image. Those are big, visible
+#     decisions, made with ./bin/qwen38 fetch-image and ./bin/qwen38 prefetch, so
 #     an install can be re-run on a shared box without touching the disk budget.
 #   * it calls sudo itself, exactly twice, both for /etc writes. Do NOT run this
 #     script under sudo: $HOME becomes /root, the cache paths in config.local
@@ -126,8 +126,9 @@ echo "== installed. The engine is NOT started yet, on purpose."
 echo "   Weights and the image are still on the network, and starting is the"
 echo "   expensive, visible part of this. When you are ready:"
 echo
-echo "     ./bin/qwen38 pull --pull     # ~14 GB image, once"
-echo "     sudo systemctl start ${UNIT_NAME}     # boot is 7-9 min; it also downloads ~24 GB of weights"
+echo "     ./bin/qwen38 fetch-image     # 13.41 GiB image (docker pull stalls where dockerd has no proxy)"
+echo "     ./bin/qwen38 prefetch        # 25.72 GiB of weights, on the host; the container cannot reach the Hub here"
+echo "     sudo systemctl start ${UNIT_NAME}     # boot is 7-9 min"
 echo "     ./bin/qwen38 canary          # correctness gate; speed without this is unmeasured"
 echo "     ./bin/qwen38 bench --save    # and ./bin/qwen38 runs to see the ledger"
 echo

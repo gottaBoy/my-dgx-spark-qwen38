@@ -12,9 +12,11 @@ import importlib.util
 import io
 import os
 import re
-import urllib.request
 import unittest
+import urllib.request
 from pathlib import Path
+
+from qwen38 import net
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -161,14 +163,36 @@ class TestMetricParsing(unittest.TestCase):
 
 
 class TestHelpSurface(unittest.TestCase):
-    NAMES = ["doctor", "fit", "plan", "pull", "start", "service-start", "wait",
-             "status", "stop", "logs", "canary", "bench", "guard", "metrics",
-             "observe", "compare", "runs", "config", "tune"]
+    @classmethod
+    def _command_names(cls) -> list[str]:
+        """Read the command list out of --help rather than keeping a second copy.
+
+        A hand-maintained list is a second source of truth, and it goes stale in
+        the direction that hides the problem: a subcommand gets added, the list
+        does not, and then any message pointing at it passes un-checked. This is
+        the same class of bug the upstream repos each needed a CI invariant for.
+        """
+        _code, out, _err = run_cli("--help")
+        match = re.search(r"\{([a-z][a-z0-9,-]*)\}", out)
+        if not match:
+            raise AssertionError(f"no subcommand list found in --help:\n{out[:400]}")
+        return sorted(match.group(1).split(","))
 
     def test_every_subcommand_has_a_help_page(self):
+        names = self._command_names()
+        # A floor, not an equality: the list must be real, and an empty or
+        # truncated parse must fail loudly rather than make the loop below vacuous.
+        self.assertGreaterEqual(len(names), 20, names)
         _code, out, _err = run_cli("--help")
-        for name in self.NAMES:
+        for name in names:
             self.assertIn(name, out, name)
+
+    def test_service_start_and_prefetch_are_discoverable(self):
+        # Added by name on purpose. These two are load-bearing for the unit and
+        # for a first install, and a derived list would not notice either vanishing.
+        names = self._command_names()
+        for name in ("service-start", "prefetch", "verify-pins", "start", "doctor"):
+            self.assertIn(name, names, name)
 
     def test_service_start_is_a_real_command_the_unit_can_call(self):
         # The unit template references it by name; a rename that misses the
@@ -199,7 +223,7 @@ class TestHelpSurface(unittest.TestCase):
                    *_ROOT.glob("docs/*.md"), _ROOT / "README.md",
                    *_ROOT.glob("*.sh"), *_ROOT.glob("unit/*")]
         pattern = re.compile(r"\bqwen38 ([a-z][a-z-]+)")
-        known = set(self.NAMES) | {"--help"}
+        known = set(self._command_names()) | {"--help"}
         offenders: list[str] = []
         for path in sources:
             if not path.is_file():
@@ -265,29 +289,30 @@ class TestLocalRequestsBypassProxies(unittest.TestCase):
             else:
                 os.environ[key] = value
 
-    def test_direct_opener_reaches_loopback_with_a_proxy_configured(self):
-        body = cli._direct_opener().open(f"http://127.0.0.1:{self.port}/", timeout=5).read()
+    def test_local_opener_reaches_loopback_with_a_proxy_configured(self):
+        body = net.local_opener().open(f"http://127.0.0.1:{self.port}/", timeout=5).read()
         self.assertEqual(body, b"DIRECT-OK")
 
     def test_the_naive_path_is_the_one_that_breaks(self):
         # Guard the premise. If the standard library ever fixes loopback bypass,
-        # this fails, and the workaround in _direct_opener can be deleted rather
+        # this fails, and the workaround in net.local_opener can be deleted rather
         # than left as folklore.
         with self.assertRaises(OSError):
             urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=5)
 
-    def test_default_urlopen_would_have_been_affected(self):
-        # Guard the premise, not just the fix: if this ever stops being true the
-        # comment above is stale and the workaround is dead weight.
-        import os
-        import urllib.request
-        if not (os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")):
-            self.skipTest("no proxy configured in this environment")
-        proxies = urllib.request.getproxies()
-        self.assertIn("http", proxies)
-        self.assertFalse(
-            urllib.request.proxy_bypass_environment("127.0.0.1"),
-            "no_proxy now bypasses 127.0.0.1; the _direct_opener comment needs updating")
+    def test_remote_opener_keeps_the_system_proxy(self):
+        # The opposite rule, and the one that cost a 30 s hang to learn: the Hub
+        # is reachable HERE only through the proxy, so the shared helper must not
+        # strip it for external calls the way it does for loopback.
+        # Asserted by behaviour, not by poking at handler internals: ProxyHandler
+        # is not in OpenerDirector.handlers, so an internals test here was wrong
+        # twice before it was right. setUp points the environment proxy at a dead
+        # port, so "honours the proxy" means "fails", and "bypasses it" means
+        # "connects". Same fixture, opposite expectations.
+        with self.assertRaises(OSError):
+            net.remote_opener().open(f"http://127.0.0.1:{self.port}/", timeout=5)
+        body = net.local_opener().open(f"http://127.0.0.1:{self.port}/", timeout=5).read()
+        self.assertEqual(body, b"DIRECT-OK")
 
 
 class TestHealthProbesDoNotLie(unittest.TestCase):

@@ -55,13 +55,34 @@ separate, visible commands, because on a shared machine they are disk and
 bandwidth decisions someone should make on purpose:
 
 ```bash
-./bin/qwen38 pull --pull       # the engine image, ~14 GB
+./bin/qwen38 fetch-image      # the engine image: 13.41 GiB compressed, arm64
+./bin/qwen38 prefetch         # the weights: 25.72 GiB (22.14 target + 3.58 draft)
 ```
 
-Weights download on first boot into `~/.cache/qwen38-spark/huggingface`
-(~24 GB for the NVFP4 target, ~2.6 GB more for the DFlash2 draft). That happens
-inside the container, so it is the one part you cannot do ahead of time -- but
-`doctor` checks there is room for it first.
+Both run on the host, and on the reference box they have to. Two measured facts:
+
+* `docker pull` of the engine image stalled at **59 KiB/s**, because dockerd
+  carries no proxy and this network reaches the registry only through one.
+  Reconfiguring dockerd would restart the 24 containers already running here, so
+  `fetch-image` uses a proxy-honouring registry client and hands the result to
+  `docker load`. dockerd never needs the network.
+* A container here cannot reach huggingface.co at all (verified from inside one:
+  connection timed out). So the "weights download themselves on first boot"
+  behaviour every upstream recipe relies on is not a slow start here, it is a
+  hang. `prefetch` lands them in the cache the container mounts.
+
+Use `pull --pull` instead of `fetch-image` only where dockerd itself has egress.
+
+`prefetch` needs `huggingface_hub`, which is deliberately not a dependency of the
+CLI (the CLI is stdlib-only, so the suite runs anywhere):
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install huggingface_hub
+```
+
+Both are resumable. Interrupted downloads leave `.incomplete` blobs that the
+client continues from, which is why `qwen38 doctor` reports in-flight bytes
+rather than treating a partial cache as either empty or ready.
 
 Then start:
 
