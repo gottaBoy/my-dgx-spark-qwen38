@@ -1,0 +1,15 @@
+# Per-box overrides. Tracked-by-exception: the file is the right place for a
+# local knob, but its contents are a property of one machine.
+conf/config.local
+
+# Runtime artifacts. state/evidence is the run ledger and is the one thing here
+# worth backing up rather than regenerating, so it is ignored by default and
+# committed deliberately with `git add -f state/evidence/<run>/run.json`.
+state/
+
+__pycache__/
+*.pyc
+
+# Leftovers from an interrupted run.
+*.tmp
+.sglang.log

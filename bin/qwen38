@@ -1,0 +1,1170 @@
+#!/usr/bin/env python3
+"""qwen38 -- a measured, coexistence-first serving harness for Qwen3.8 on GB10.
+
+Design contract, in the order it matters:
+  1. never endanger the other workloads on this box
+  2. never launch a configuration that has not been checked against the box
+  3. never produce a number that is not attached to the config that made it
+
+Commands that change nothing (doctor, plan, fit, status, bench, compare, tune
+--plan) are safe to run any time, including on a machine with no GPU.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+from qwen38 import cpuset as cpuset_mod
+from qwen38 import (evidence, guard, memfit, plan as plan_mod, ports, profiles,
+                    settings, settle)
+
+CONTAINER = "qwen38-spark"
+PROBE_TIMEOUT_S = 600
+
+
+# --- helpers -------------------------------------------------------------------
+
+
+def _run(argv: list[str], *, timeout: int = 60, check: bool = False,
+         stdin: str | None = None) -> subprocess.CompletedProcess:
+    """Run a host command. Never shell=True: argv is data, not code."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=stdin)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(argv, 127, "", f"{argv[0]!r} not on PATH")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout}s")
+    if check and proc.returncode != 0:
+        raise SystemExit(f"{argv[0]} failed ({proc.returncode}): {proc.stderr.strip()[:400]}")
+    return proc
+
+
+def _git_sha(root: Path) -> str:
+    proc = _run(["git", "-C", str(root), "rev-parse", "--short", "HEAD"], timeout=10)
+    return proc.stdout.strip() if proc.returncode == 0 else "uncommitted"
+
+
+def _cuda_total_gib(s: settings.Settings, timeout: int) -> tuple[float | None, str]:
+    """Ask the pinned image what CUDA thinks the pool is.
+
+    Refuses unless the image is already local. That guard is not cosmetic:
+    `docker run` on a missing image starts an implicit 14 GB pull, and a
+    subprocess timeout kills the docker CLI but not the daemon-side pull -- so a
+    "quick probe" can quietly fill the disk and cannot be cleanly cancelled. This
+    was found the first time `qwen38 start --dry-run` began downloading on a box
+    that had never pulled the image.
+    """
+    if not docker_present(s):
+        return None, "image not pulled; run `qwen38 pull --pull` first"
+    proc = _run(["docker", "run", "--rm", "--gpus", "all", s.get("Q38_IMAGE_DIGEST"),
+                 "python3", "-c", memfit.MEASURE_CUDA_TOTAL], timeout=max(timeout, 120))
+    if proc.returncode != 0:
+        return None, f"container probe failed: {proc.stderr.strip()[:200]}"
+    total = memfit.parse_cuda_total(proc.stdout)
+    return (total, "measured via torch.cuda.mem_get_info") if total else (None, "unparseable probe output")
+
+
+def _build_inputs(s: settings.Settings, args: argparse.Namespace) -> plan_mod.Inputs:
+    profile = getattr(args, "profile", None) or s.get("Q38_PROFILE")
+    context = getattr(args, "context_length", None) or s.int("Q38_CONTEXT_LENGTH")
+    port = getattr(args, "port", None) or s.int("Q38_PORT")
+    fraction = getattr(args, "mem_fraction", None)
+    cuda_total = getattr(args, "_cuda_total", 0.0)
+    if fraction is None:
+        fit = getattr(args, "_fit", None)
+        fraction = fit.fraction if fit else s.float("Q38_MAX_FRACTION")
+    resolved_cpuset, _ = cpuset_mod.resolve(s.get("Q38_CPUSET"))
+    draft = None
+    if profiles.get(profile).needs_draft:
+        draft = s.get("Q38_DRAFT_MODEL")
+        if s.get("Q38_DRAFT_REVISION"):
+            draft = f"{draft}@{s.get('Q38_DRAFT_REVISION')}"
+    return plan_mod.Inputs(
+        model=s.get("Q38_MODEL"),
+        served_name=s.get("Q38_SERVED_NAME"),
+        image_ref=s.get("Q38_IMAGE_DIGEST"),
+        container_name=CONTAINER,
+        bind=s.get("Q38_BIND"),
+        port=port,
+        context_length=context,
+        max_concurrent=s.int("Q38_MAX_CONCURRENT"),
+        chunked_prefill=s.int("Q38_CHUNKED_PREFILL"),
+        mem_fraction=float(fraction),
+        profile=profile,
+        draft_path=draft,
+        draft_model=s.get("Q38_DRAFT_MODEL"),
+        spec_steps=s.int("Q38_SPEC_STEPS"),
+        spec_topk=s.int("Q38_SPEC_TOPK"),
+        spec_draft=s.int("Q38_SPEC_DRAFT"),
+        dspark_block=s.int("Q38_DSPARK_BLOCK"),
+        dflash_tokens=s.int("Q38_DFLASH_TOKENS"),
+        cpuset=resolved_cpuset,
+        container_mem=s.get("Q38_CONTAINER_MEM"),
+        shm_size=s.get("Q38_SHM_SIZE"),
+        privileged=s.flag("Q38_PRIVILEGED"),
+        cache_dir=str(s.cache_dir),
+        extra_server_args=s.wordlist("Q38_EXTRA_SERVER_ARGS"),
+        extra_docker_args=s.wordlist("Q38_EXTRA_DOCKER_ARGS"),
+        cuda_total_gib=cuda_total,
+    )
+
+
+def _api(port: int, path: str, payload: dict | None = None, timeout: float = 30.0):
+    url = f"http://127.0.0.1:{port}{path}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"} if data else {})
+    with _direct_opener().open(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def _direct_opener() -> urllib.request.OpenerDirector:
+    """An opener that never consults the proxy environment.
+
+    This box sets HTTP_PROXY for outbound traffic and lists `127.*` in no_proxy.
+    Python does not treat that as a wildcard -- it matches no_proxy entries by
+    suffix -- so `127.*` does not bypass `127.0.0.1`, and every request to the
+    local engine goes to the proxy instead. The symptom is a 502 against a
+    perfectly healthy server, which reads as "engine unreachable" and would send
+    you debugging the engine. A loopback API is never reached through a proxy,
+    so we say so rather than depending on the operator's no_proxy spelling.
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _ledger(s: settings.Settings) -> evidence.Ledger:
+    return evidence.Ledger(s.evidence_dir())
+
+
+# --- commands ------------------------------------------------------------------
+
+
+def cmd_doctor(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Everything the box must satisfy before we will launch, as a checklist."""
+    root = s.root
+    checks: list[tuple[str, str, str]] = []
+
+    def add(name: str, ok: bool, detail: str) -> None:
+        checks.append((name, "PASS" if ok else "FAIL", detail))
+
+    proc = _run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=20)
+    docker_ok = proc.returncode == 0
+    add("docker daemon", docker_ok, proc.stdout.strip() or proc.stderr.strip()[:120])
+
+    if docker_ok:
+        proc = _run(["docker", "ps", "--filter", f"name=^/{CONTAINER}$", "--format", "{{.Names}} {{.Status}}"])
+        add("our container free", not proc.stdout.strip(), proc.stdout.strip() or "not running")
+        proc = _run(["docker", "images", "-q", s.get("Q38_IMAGE_DIGEST")], timeout=60)
+        have_image = bool(proc.stdout.strip())
+        # A missing image is a WARN, not a FAIL: installing does not need it, only
+        # starting does, and cmd_start refuses on its own. Grading it FAIL here
+        # would make install.sh unrunnable on the fresh box it is meant for.
+        checks.append(("pinned image present", "PASS" if have_image else "WARN",
+                       s.get("Q38_IMAGE_DIGEST")[:60]
+                       + ("" if have_image else " -- run: qwen38 pull --pull")))
+
+    proc = _run(["nvidia-smi", "-L"], timeout=30)
+    gpu_ok = proc.returncode == 0 and "GPU" in proc.stdout
+    add("GPU visible to host", gpu_ok, proc.stdout.strip().splitlines()[0] if gpu_ok else proc.stderr.strip()[:120])
+
+    # Ports: probe, do not assume. Anything at/above the ephemeral floor is flagged.
+    candidates = [s.int("Q38_PORT"), s.int("Q38_STATUS_PORT")]
+    chosen, probes = ports.choose(candidates)
+    for probe in probes:
+        add(f"port {probe.port}", probe.free and (probe.port < ports.ephemeral_floor() or ports.ephemeral_floor() == 0),
+            probe.note or "free")
+    add("usable engine port", chosen is not None, str(chosen) if chosen else "refuse to launch: no free port")
+
+    resolved, note = cpuset_mod.resolve(s.get("Q38_CPUSET"))
+    add("cpuset", bool(resolved) or s.get("Q38_CPUSET") == "", f"{resolved or 'unpinned'} -- {note}")
+
+    host = memfit.read_host_memory()
+    add("host memory readable", host.available_gib > 0, f"{host.available_gib} GiB available of {host.total_gib}")
+
+    sample = guard.read_sample()
+    verdict, reason = guard.Guard(guard.Thresholds(
+        psi_some=s.float("Q38_GUARD_PSI_SOME"),
+        available_floor_gib=s.float("Q38_GUARD_AVAIL_FLOOR_GIB"),
+    )).decide(sample)
+    add("memory pressure", verdict == "ok", f"PSI some {sample.psi_some_avg10}% / full {sample.psi_full_avg10}% / avail {sample.available_gib} GiB" + (f" -- {reason}" if reason else ""))
+
+    cache = s.cache_dir
+    need_gib = 45 if profiles.get(s.get("Q38_PROFILE")).needs_draft else 30
+    if cache.exists():
+        stat = os.statvfs(cache)
+        free_gib = stat.f_bavail * stat.f_frsize / 1024**3
+    else:
+        parent = cache.parent if cache.parent.exists() else Path.home()
+        stat = os.statvfs(parent)
+        free_gib = stat.f_bavail * stat.f_frsize / 1024**3
+    add(f"cache disk >= {need_gib} GiB", free_gib >= need_gib, f"{free_gib:.0f} GiB free at {cache}")
+
+    proc = _run(["systemctl", "is-active", "systemd-oomd", "earlyoom"], timeout=15)
+    # Field-wise, not substring: "active" is inside "inactive", so a substring
+    # test reports a box with no OOM protection as protected. Found by doctor on
+    # the first run against a machine where both units are inactive.
+    states = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    oom = " ".join(states) or "unreadable"
+    protective = "active" in states
+    checks.append(("host OOM daemon", "PASS" if protective else "WARN",
+                   (oom or "none") + ("" if protective else " -- qwen38 guard supplies this role")))
+
+    width = max(len(name) for name, _, _ in checks) + 1
+    for name, status, detail in checks:
+        print(f"  {status:4s} {name:<{width}s} {detail}")
+    failed = [c for c in checks if c[1] == "FAIL"]
+    print(f"\n{len(checks) - len(failed)}/{len(checks)} checks passed"
+          + (f", {len(failed)} failed" if failed else ""))
+    return 1 if failed else 0
+
+
+def cmd_fit(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Solve --mem-fraction-static from this boot, with every input printed."""
+    cuda_total, source = (None, "skipped")
+    if not args.no_probe and docker_present(s):
+        cuda_total, source = _cuda_total_gib(s, args.timeout)
+    fit = memfit.fit_for_box(
+        reserved_gib=s.float("Q38_RESERVED_GIB"),
+        min_fraction=s.float("Q38_MIN_FRACTION"),
+        max_fraction=s.float("Q38_MAX_FRACTION"),
+        cuda_total_gib=cuda_total,
+        cuda_total_source=source,
+    )
+    print(json.dumps(fit.as_dict(), indent=2))
+    for warning in fit.warnings:
+        print(f"  note: {warning}", file=sys.stderr)
+    if fit.fraction == 0.0:
+        return 1
+    if args.json:
+        return 0
+    print(f"\n-> --mem-fraction-static {fit.fraction}   (bound by {fit.bound_by})")
+    print(f"   upstream pins for contrast: 0.95/0.90 dedicated, 0.76 for 1M, 0.70, 0.50")
+    return 0
+
+
+def docker_present(s: settings.Settings) -> bool:
+    return _run(["docker", "images", "-q", s.get("Q38_IMAGE_DIGEST")], timeout=60).stdout.strip() != ""
+
+
+def cmd_plan(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Print the exact argv. Changes nothing on the box."""
+    fit = None
+    if args.mem_fraction is None:
+        cuda_total = None
+        if not args.no_probe and docker_present(s):
+            cuda_total, _ = _cuda_total_gib(s, args.timeout)
+        args._cuda_total = cuda_total or 0.0
+        fit = memfit.fit_for_box(
+            reserved_gib=s.float("Q38_RESERVED_GIB"), min_fraction=s.float("Q38_MIN_FRACTION"),
+            max_fraction=s.float("Q38_MAX_FRACTION"), cuda_total_gib=cuda_total)
+        args._fit = fit
+    inputs = _build_inputs(s, args)
+    built = plan_mod.build(inputs)
+    if args.json:
+        print(json.dumps(built.as_dict(), indent=2))
+        return 0
+    print(f"profile   : {inputs.profile} -- {profiles.get(inputs.profile).summary}")
+    print(f"image     : {inputs.image_ref}")
+    print(f"listen    : {inputs.bind}:{inputs.port}  (model name {inputs.served_name!r})")
+    print(f"fraction  : {inputs.mem_fraction}" + (f"  [fitted: bound by {fit.bound_by}]" if fit else "  [given]"))
+    print(f"cpuset    : {inputs.cpuset or '(unpinned)'}")
+    if fit:
+        print(f"fit inputs: avail {fit.available_gib} GiB - reserved {fit.reserved_gib} = {fit.askable_gib} over {fit.cuda_total_gib} GiB pool")
+    for note in built.notes:
+        print(f"check     : {note}")
+    print("\n$ " + built.render_docker().replace(" \\\n", ""))
+    return 0
+
+
+def cmd_pull(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Resolve the alias tag to a digest and compare against our pin."""
+    proc = _run(["docker", "buildx", "imagetools", "inspect", s.get("Q38_IMAGE_ALIAS"),
+                 "--format", "{{json .Manifest.Digest}}"], timeout=120)
+    if proc.returncode != 0:
+        print(f"cannot resolve {s.get('Q38_IMAGE_ALIAS')}: {proc.stderr.strip()[:300]}", file=sys.stderr)
+        return 1
+    live = json.loads(proc.stdout.strip())
+    pinned = s.get("Q38_IMAGE_DIGEST").split("@")[-1]
+    if live == pinned:
+        print(f"pin matches upstream: {pinned}")
+    else:
+        print(f"DRIFT: pinned {pinned}\n       upstream {live}\n\n"
+              f"Upstream moved the tag. Read the changelog for the new build before\n"
+              f"re-pinning, then re-run the acceptance benchmarks -- a newer image is\n"
+              f"not automatically a faster one on this hardware.", file=sys.stderr)
+    if args.pull:
+        return _run(["docker", "pull", s.get("Q38_IMAGE_DIGEST")], timeout=7200).returncode
+    return 0 if live == pinned else 2
+
+
+def cmd_start(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Fit, check, launch, record. Refuses rather than improvises."""
+    root = s.root
+    if args.dry_run:
+        return _start_dry_run(s, args)
+
+    # The image must already be local. `docker run` on a missing digest starts an
+    # implicit pull of ~14 GB, which is a decision about disk and bandwidth this
+    # command should not make silently -- and it cannot be cleanly cancelled,
+    # because killing the docker CLI leaves the daemon-side pull running. That is
+    # not hypothetical: the first `start --dry-run` on a fresh box began a pull.
+    if not args.allow_pull and not docker_present(s):
+        print(f"REFUSED: the pinned image is not present locally.\n"
+              f"  {s.get('Q38_IMAGE_DIGEST')}\n"
+              f"Pull it deliberately with `qwen38 pull --pull` (check the disk free in\n"
+              f"`qwen38 doctor` first), or pass --allow-pull to let start do it.",
+              file=sys.stderr)
+        return 3
+
+    sample = guard.read_sample()
+    gate = guard.Guard(guard.Thresholds(
+        psi_some=s.float("Q38_GUARD_PSI_SOME"),
+        available_floor_gib=s.float("Q38_GUARD_AVAIL_FLOOR_GIB")))
+    verdict, reason = gate.decide(sample)
+    if verdict == "trip":
+        print(f"REFUSED: host is already under memory pressure ({reason}).\n"
+              f"Nothing was launched. Wait, or free memory, or lower Q38_RESERVED_GIB\n"
+              f"if you own this box.", file=sys.stderr)
+        return 3
+
+    chosen, probes = ports.choose([s.int("Q38_PORT"), s.int("Q38_STATUS_PORT")])
+    if chosen is None:
+        print("REFUSED: no usable port. Probes:\n  " +
+              "\n  ".join(f"{p.port}: {'free' if p.free else p.note}" for p in probes), file=sys.stderr)
+        return 3
+    args.port = chosen
+
+    cuda_total = None
+    if not args.skip_probe:
+        cuda_total, source = _cuda_total_gib(s, args.timeout)
+        args._cuda_total = cuda_total or 0.0
+    fit = memfit.fit_for_box(
+        reserved_gib=s.float("Q38_RESERVED_GIB"), min_fraction=s.float("Q38_MIN_FRACTION"),
+        max_fraction=s.float("Q38_MAX_FRACTION"), cuda_total_gib=cuda_total)
+    args._fit = fit
+    if fit.fraction == 0.0 or fit.bound_by == "no-headroom":
+        print("REFUSED: " + (fit.warnings[0] if fit.warnings else "no memory budget"), file=sys.stderr)
+        return 3
+
+    inputs = _build_inputs(s, args)
+    built = plan_mod.build(inputs)
+
+    existing = _run(["docker", "ps", "-a", "--filter", f"name=^/{CONTAINER}$",
+                     "--format", "{{.Names}}\t{{.Status}}"]).stdout.strip()
+    if existing:
+        name, _, status = existing.partition("\t")
+        if "Up" in status:
+            print(f"{name} is already running ({status}); use `qwen38 stop` first.", file=sys.stderr)
+            return 3
+        # Stopped but present: its name is taken and its log holds the last crash.
+        # Capture before removing, since removal destroys the evidence.
+        tail = _run(["docker", "logs", "--tail", "40", name], timeout=30).stdout
+        if tail:
+            (s.state_dir / "engine.prev.log").write_text(tail, encoding="utf-8")
+        _run(["docker", "rm", name], timeout=60)
+
+    s.cache_dir.mkdir(parents=True, exist_ok=True)
+    (s.state_dir).mkdir(parents=True, exist_ok=True)
+    log_path = s.state_dir / "engine.log"
+
+    print(f"launching profile {inputs.profile} on :{inputs.port} "
+          f"(fraction {inputs.mem_fraction}, cpuset {inputs.cpuset or 'off'})")
+    proc = _run(list(built.docker_argv), timeout=180)
+    if proc.returncode != 0:
+        print(f"docker run failed: {proc.stderr.strip()[:600]}", file=sys.stderr)
+        return 1
+
+    run_id = args.run_id or evidence.new_run_id(inputs.profile)
+    ledger = _ledger(s)
+    ledger.create(run_id, git_sha=_git_sha(root), plan=built.as_dict(), fit=fit.as_dict())
+    ledger.append(run_id, event={"kind": "launch", "container": proc.stdout.strip()[:16],
+                                 "log": str(log_path)})
+    (s.state_dir / "current_run").write_text(run_id + "\n", encoding="utf-8")
+
+    if args.no_wait:
+        print(f"run_id {run_id}; not waiting. Follow with: qwen38 wait --run {run_id}")
+        return 0
+    return cmd_wait(argparse.Namespace(**{**vars(args), "run": run_id, "timeout": args.boot_timeout,
+                                          "s": s}), settings=s)
+
+
+def _start_dry_run(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Show what a real start would do, without touching the box.
+
+    Its own code path rather than an early return inside cmd_start: the real
+    start probes the CUDA pool through docker, and a "dry run" that pulls 14 GB
+    is not dry. Here the only inputs are config files and /proc.
+    """
+    fit = memfit.fit_for_box(
+        reserved_gib=s.float("Q38_RESERVED_GIB"),
+        min_fraction=s.float("Q38_MIN_FRACTION"),
+        max_fraction=s.float("Q38_MAX_FRACTION"),
+        cuda_total_gib=None,
+        cuda_total_source="not probed (dry run)",
+    )
+    args._fit = fit
+    args._cuda_total = 0.0
+    built = plan_mod.build(_build_inputs(s, args))
+
+    print("[dry-run] nothing launched, nothing pulled, nothing written.")
+    print(f"  fit       : {fit.fraction} -- {fit.cuda_total_source}; "
+          f"bound by {fit.bound_by}. Run `qwen38 fit` to measure the pool.")
+    print(f"  refuse if : PSI some >= {s.float('Q38_GUARD_PSI_SOME')}% "
+          f"or MemAvailable < {s.float('Q38_GUARD_AVAIL_FLOOR_GIB')} GiB "
+          f"for {s.int('Q38_GUARD_TRIP_STRIKES')} consecutive samples")
+    print(f"  ports     : would probe {s.get('Q38_PORT')},{s.get('Q38_STATUS_PORT')} "
+          f"and take the first free one below the ephemeral floor")
+    print(f"  cpuset    : {built.inputs.cpuset or '(unpinned)'}")
+    print(f"  listen    : {built.inputs.bind}:{built.inputs.port}")
+    print(f"  image     : {built.inputs.image_ref}")
+    print(f"  ledger    : {s.evidence_dir()}/<run-id>/run.json")
+    for note in built.notes:
+        print(f"  check     : {note}")
+    print("\n$ " + built.render_docker())
+    return 0
+
+
+def cmd_wait(args: argparse.Namespace, *, settings: settings.Settings | None = None) -> int:
+    """Poll /health until ready or the container dies. Boot is ~7-9 min; say so."""
+    s = settings or args.s
+    run_id = args.run
+    port = s.int("Q38_PORT")
+    ledger = _ledger(s)
+    deadline = time.time() + args.timeout
+    started = time.time()
+    print(f"waiting for :{port} (CUDA graph capture + kernel compile; up to {args.timeout}s)")
+    while time.time() < deadline:
+        running = _run(["docker", "ps", "--format", "{{.Names}}"]).stdout.split()
+        if CONTAINER not in running:
+            tail = _run(["docker", "logs", "--tail", "60", CONTAINER], timeout=30).stdout
+            (s.state_dir / "engine.log").write_text(tail, encoding="utf-8") if tail else None
+            if run_id:
+                ledger.append(run_id, status="failed", event={"kind": "exited", "log_tail": tail[-2000:]})
+            print("container exited before becoming ready; last 60 log lines:\n" + tail, file=sys.stderr)
+            return 1
+        try:
+            _api(port, "/health", timeout=5)
+        except (urllib.error.URLError, OSError):
+            time.sleep(5)
+            continue
+        elapsed = round(time.time() - started)
+        if run_id:
+            ledger.append(run_id, status="ready", event={"kind": "ready", "seconds": elapsed})
+        print(f"ready after {elapsed}s -- run_id {run_id}")
+        return 0
+    print(f"not ready after {args.timeout}s; inspect: qwen38 logs", file=sys.stderr)
+    return 1
+
+
+def cmd_service_start(s: settings.Settings, args: argparse.Namespace) -> int:
+    """The systemd entry point: wait for the box to stop moving, then start.
+
+    Why this is not simply `start`: during boot the neighbours are still coming
+    up, so MemAvailable is temporarily at its peak. A fraction fitted at that
+    instant over-asks, and the failure surfaces minutes later at CUDA graph
+    capture, which is how upstream documents "hard reboot, root cause unclear".
+    Settling is what closes the race instead of lowering a constant to hide it.
+    """
+    print("settling: waiting for host memory to stop moving before fitting")
+    verdict, spent = settle.wait_until_stable(
+        lambda: memfit.read_host_memory().available_gib,
+        max_drift_gib=s.float("Q38_SETTLE_MAX_DRIFT_GIB"),
+        stable_samples=s.int("Q38_SETTLE_STABLE_SAMPLES"),
+        interval_s=s.int("Q38_SETTLE_INTERVAL_S"),
+        deadline_s=s.int("Q38_SETTLE_DEADLINE_S"),
+    )
+    if verdict is None:
+        print("REFUSED: cannot read /proc/meminfo. Nothing launched.", file=sys.stderr)
+        return 3
+    if not verdict.settled:
+        # Refusing costs an outage window and is still the right call: launching
+        # on a box that has not settled risks whichever neighbour allocates next,
+        # and Restart=on-failure means a refusal is a retry, not a loss.
+        print(f"REFUSED after {spent:.0f}s: host memory is still moving (drift "
+              f"{verdict.drift_gib} GiB over {len(verdict.samples)} samples). Raise "
+              f"Q38_SETTLE_DEADLINE_S if the boot is simply slow.", file=sys.stderr)
+        return 3
+    print(f"settled after {spent:.0f}s (drift {verdict.drift_gib} GiB over "
+          f"{len(verdict.samples)} samples)")
+    rc = cmd_start(s, args)
+    if rc != 0:
+        return rc
+    # Block here on purpose. Under Type=simple, systemd treats this process as
+    # the service, so returning after a successful boot would mark the unit
+    # inactive while the container keeps serving -- a unit that says "inactive"
+    # next to a healthy engine is how operators stop trusting `systemctl status`.
+    # Following the engine's log keeps the process alive AND puts SGLang's own
+    # output in the journal, so `journalctl -u qwen38-spark` needs no second
+    # command. systemd stops us with SIGTERM, we exit, and ExecStop runs
+    # `qwen38 stop`, which is the ordering we want.
+    return _follow_engine_logs()
+
+
+def _follow_engine_logs() -> int:
+    print(f"engine ready; following {CONTAINER} logs into the journal (Ctrl+C detaches)",
+          flush=True)
+    try:
+        subprocess.call(["docker", "logs", "-f", "--tail", "0", CONTAINER])
+    except KeyboardInterrupt:
+        # A human on the terminal; under systemd this path is SIGTERM, not this.
+        return 0
+    # The follow also ends when the container stops, and that must not read as a
+    # success: exiting 0 here leaves the unit "inactive" next to a crashed engine
+    # and Restart=on-failure never fires. That is the one failure shape in this
+    # design that would go unnoticed, so it is graded as a failure.
+    if CONTAINER in _run(["docker", "ps", "--format", "{{.Names}}"]).stdout.split():
+        return 0
+    print(f"{CONTAINER} stopped; exiting non-zero so systemd restarts it", file=sys.stderr)
+    return 1
+
+
+def cmd_status(s: settings.Settings, args: argparse.Namespace) -> int:
+    proc = _run(["docker", "ps", "--filter", f"name=^/{CONTAINER}$",
+                 "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"])
+    if not proc.stdout.strip():
+        print(f"{CONTAINER}: not running")
+    else:
+        name, status, image = proc.stdout.strip().split("\t")
+        print(f"{name}: {status}\n  image {image}")
+    # Per-container stats only. A whole-host `docker stats --no-stream` takes
+    # over a minute on a box with 24 containers, which is useless in a loop.
+    stats = _run(["docker", "stats", "--no-stream", "--format", "{{.MemUsage}}\t{{.CPUPerc}}", CONTAINER],
+                 timeout=30)
+    if stats.returncode == 0 and stats.stdout.strip():
+        print(f"  rss/cpu {stats.stdout.strip()}")
+    sample = guard.read_sample()
+    print(f"host: PSI some {sample.psi_some_avg10}% full {sample.psi_full_avg10}% | "
+          f"avail {sample.available_gib} GiB | swap used {sample.swap_used_gib} GiB")
+    runs = _ledger(s).list_runs()
+    if runs:
+        latest = runs[-1]
+        record = _ledger(s).load(latest)
+        print(f"ledger: {len(runs)} run(s); latest {latest} [{record.status}] {record.metrics}")
+    return 0
+
+
+def cmd_stop(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Stop and remove OUR container only. Never enumerates a neighbour's."""
+    proc = _run(["docker", "stop", "-t", str(args.grace), CONTAINER], timeout=args.grace + 60)
+    if proc.returncode != 0:
+        print(proc.stderr.strip()[:300], file=sys.stderr)
+    _run(["docker", "rm", CONTAINER], timeout=60)
+    runs = _ledger(s).list_runs()
+    current = s.state_dir / "current_run"
+    if current.exists():
+        run_id = current.read_text().strip()
+        if run_id in runs:
+            _ledger(s).append(run_id, status="finished", event={"kind": "stop"})
+    print(f"{CONTAINER} stopped")
+    return 0
+
+
+def cmd_metrics(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Read the engine's own counters, and say what each one is evidence for.
+
+    These are the numbers that separate "it feels slow today" from "the KV pool
+    is the bottleneck and accept length fell". Parsed from the Prometheus text
+    exposition by hand rather than pulled in as a client library: the engine
+    exposes gauges and counters, the interesting ones are a handful, and a
+    dependency here costs the whole suite its ability to run offline.
+    """
+    port = s.int("Q38_PORT")
+    try:
+        raw = _direct_opener().open(f"http://127.0.0.1:{port}/metrics", timeout=15).read().decode()
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"engine unreachable on :{port}: {exc}", file=sys.stderr)
+        return 1
+    found = _parse_metrics(raw)
+    width = max(len(k) for k in METRIC_MEANINGS) + 1
+    for name, meaning in METRIC_MEANINGS.items():
+        value = found.get(name)
+        shown = f"{value:.4f}" if value is not None else "(absent)"
+        print(f"  {name:<{width}s} {shown:>10s}   {meaning}")
+    sample = guard.read_sample()
+    print(f"\n  host: PSI some {sample.psi_some_avg10}% / avail {sample.available_gib} GiB")
+    if "sglang:spec_accept_length" not in found and s.get("Q38_PROFILE") != "ar":
+        print("  note: no speculative counters. Either this build renamed them or the "
+              "drafter never engaged -- check the DFLASH banner in `qwen38 logs`.")
+    return 0
+
+
+METRIC_MEANINGS = {
+    "sglang:num_running_reqs": "requests in the batch; below max_running_requests means something else is the limit",
+    "sglang:token_usage": "KV pool occupancy; pinned near 1.0 means the pool is the bottleneck, not the GPU",
+    "sglang:cache_hit_rate": "prefix cache hit rate; low means the shared prompt is not being reused",
+    "sglang:spec_accept_length": "mean drafted tokens accepted per verify step; the single best drafter-health number",
+    "sglang:spec_accept_rate": "accepted/drafted; falls when draft and target disagree",
+    "sglang:gen_throughput": "aggregate decode tok/s as the engine counts it",
+    "sglang:num_queue_reqs": "waiting requests; nonzero under load means admission is saturated",
+}
+
+
+def _parse_metrics(raw: str) -> dict[str, float]:
+    """Pull the scalars we care out of a Prometheus text body.
+
+    Labels are dropped on purpose: these gauges are per-engine, and keeping the
+    label set would mean choosing one of several identical series by accident.
+    """
+    out: dict[str, float] = {}
+    for line in raw.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition(" ")
+        name = key.split("{")[0]
+        if name not in METRIC_MEANINGS:
+            continue
+        try:
+            out[name] = float(value.strip())
+        except ValueError:
+            continue
+    return out
+
+
+def cmd_observe(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Append host + engine + container samples to one JSONL.
+
+    Deliberately a file, not a dashboard: something you can grep, join against
+    the ledger, and diff between two boots is more useful at 3 a.m. than a graph,
+    and costs nothing to keep. Container stats are requested for OUR container
+    only -- a whole-host `docker stats --no-stream` took over a minute on this
+    box, which makes any sampling loop useless.
+    """
+    out = s.state_dir / "observe.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    interval = max(2, args.interval)
+    print(f"observing every {interval}s -> {out}  (Ctrl+C to stop)")
+    try:
+        while True:
+            row: dict = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            sample = guard.read_sample()
+            row.update(psi_some=sample.psi_some_avg10, psi_full=sample.psi_full_avg10,
+                       avail_gib=sample.available_gib, swap_used_gib=sample.swap_used_gib)
+            stats = _run(["docker", "stats", "--no-stream", "--format",
+                          "{{.MemUsage}}\t{{.CPUPerc}}", CONTAINER], timeout=30)
+            if stats.returncode == 0 and stats.stdout.strip():
+                mem, _, cpu = stats.stdout.strip().partition("\t")
+                row["container_mem"] = mem
+                row["container_cpu"] = cpu.rstrip("%")
+            else:
+                row["container"] = "not running"
+            try:
+                raw = _direct_opener().open(
+                    f"http://127.0.0.1:{s.int('Q38_PORT')}/metrics", timeout=5).read().decode()
+                row.update(_parse_metrics(raw))
+            except (urllib.error.URLError, OSError):
+                row["engine"] = "unreachable"
+            with out.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+            print("  " + json.dumps(row, sort_keys=True), flush=True)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print(f"\nstopped; history in {out}")
+        return 0
+
+
+def cmd_logs(s: settings.Settings, args: argparse.Namespace) -> int:
+    if args.follow:
+        # Hand the tty over: a piped follow needs to survive Ctrl+C itself.
+        return subprocess.call(["docker", "logs", "-f", "--tail", str(args.tail), CONTAINER])
+    proc = _run(["docker", "logs", "--tail", str(args.tail), CONTAINER], timeout=60)
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr[-4000:] if proc.stderr else "")
+    # The one grep that answers "did the flags I asked for actually take effect",
+    # which is the single most common silent failure across all three upstream repos.
+    for pattern in ("speculative_algorithm=", "max_running_requests=", "max_mamba_cache_size=",
+                    "context_len=", "KV cache pool tokens"):
+        for line in (proc.stdout + proc.stderr).splitlines():
+            if pattern in line:
+                print(f"  effect: {line.strip()[:160]}")
+                break
+    return proc.returncode
+
+
+def cmd_canary(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Correctness gate. Speed without this is unmeasured, not fast.
+
+    19*23=437 is the arithmetic canary r0b0 use: it is short enough to be
+    deterministic at temperature 0 and long enough that a broken spec path
+    shows up as a wrong digit. We run it three ways: greedy, thinking off, and
+    with a tool call, because those exercise three different decode paths.
+    """
+    port = s.int("Q38_PORT")
+    checks = [
+        ("arithmetic greedy", "What is 19 times 23? Answer with only the number.", "437", False),
+        ("arithmetic thinking", "What is 19 times 23? Answer with only the number.", "437", True),
+    ]
+    failures = 0
+    for name, prompt, expect, thinking in checks:
+        payload = {"model": s.get("Q38_SERVED_NAME"),
+                   "messages": [{"role": "user", "content": prompt}],
+                   "temperature": 0.0, "max_tokens": 200 if thinking else 16,
+                   "chat_template_kwargs": {"enable_thinking": thinking}}
+        try:
+            body = _api(port, "/v1/chat/completions", payload, timeout=PROBE_TIMEOUT_S)
+        except (urllib.error.URLError, OSError) as exc:
+            print(f"  FAIL {name:20s} request error: {exc}")
+            failures += 1
+            continue
+        content = (body["choices"][0]["message"]["content"] or "")
+        ok = expect in content
+        print(f"  {'PASS' if ok else 'FAIL'} {name:20s} {content.strip()[:60]!r}")
+        failures += 0 if ok else 1
+
+    tools = {"type": "function", "function": {
+        "name": "get_weather", "description": "Look up weather",
+        "parameters": {"type": "object", "properties": {
+            "city": {"type": "string", "description": "City name"}},
+            "required": ["city"]}}}
+    payload = {"model": s.get("Q38_SERVED_NAME"),
+               "messages": [{"role": "user", "content": "What is the weather in Shanghai?"}],
+               "temperature": 0.0, "max_tokens": 128, "tools": [tools],
+               "chat_template_kwargs": {"enable_thinking": False}}
+    try:
+        body = _api(port, "/v1/chat/completions", payload, timeout=PROBE_TIMEOUT_S)
+        calls = body["choices"][0]["message"].get("tool_calls") or []
+        ok = bool(calls) and calls[0]["function"]["name"] == "get_weather"
+        print(f"  {'PASS' if ok else 'FAIL'} {'tool calling':20s} {json.dumps(calls)[:70]}")
+        failures += 0 if ok else 1
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"  FAIL {'tool calling':20s} request error: {exc}")
+        failures += 1
+
+    current = s.state_dir / "current_run"
+    if current.exists() and current.read_text().strip() in _ledger(s).list_runs():
+        _ledger(s).append(current.read_text().strip(), event={"kind": "canary",
+                                                              "failures": failures})
+    print(f"\n{3 - failures}/3 canaries passed")
+    return 1 if failures else 0
+
+
+def cmd_bench(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Net-decode tok/s by the two-call delta, with warmup discarded.
+
+    Why two calls and not one: a single timed generation charges prefill to
+    the measurement, so the number depends on prompt length and cache state
+    rather than on decode speed. Same prompt at 60 and 600 tokens, subtracted,
+    cancels prefill and template cost -- that is the decode rate.
+
+    Why the first pass is thrown away: upstream measured cold-start artefacts of
+    89, 183 and -371 tok/s on the first call after a boot. A negative number from
+    a benchmark is a signal about your method, not about the model.
+    """
+    port = s.int("Q38_PORT")
+    probes = {
+        "code": "Write a Python class LRUCache with O(1) get and put using OrderedDict, plus a small test.",
+        "essay": "Write a detailed technical essay on the history of computing, from Babbage to GPUs.",
+    }
+    names = list(probes) if args.probe == "all" else [args.probe]
+    thinking = {"code": False, "essay": False}[names[0]] if len(names) == 1 else False
+
+    def call(prompt: str, max_tokens: int) -> tuple[float, int]:
+        payload = {"model": s.get("Q38_SERVED_NAME"),
+                   "messages": [{"role": "user", "content": prompt}],
+                   "temperature": 0.0, "max_tokens": max_tokens,
+                   "chat_template_kwargs": {"enable_thinking": thinking}}
+        start = time.time()
+        try:
+            body = _api(port, "/v1/chat/completions", payload, timeout=PROBE_TIMEOUT_S)
+        except urllib.error.HTTPError as exc:
+            raise SystemExit(f"HTTP {exc.code}: {exc.read()[:200]!r}") from None
+        except (urllib.error.URLError, OSError) as exc:
+            raise SystemExit(f"engine unreachable on :{port}: {exc}") from None
+        return time.time() - start, body["usage"]["completion_tokens"]
+
+    call("Say OK", 16)          # warmup, deliberately discarded
+    results: dict[str, list[float]] = {}
+    for name in names:
+        values: list[float] = []
+        for _ in range(args.repeats):
+            d1, c1 = call(probes[name], 60)
+            d2, c2 = call(probes[name], 600)
+            denominator = d2 - d1
+            if denominator <= 0 or c2 - c1 <= 0:
+                print(f"  {name:6s} inconclusive (c1={c1},c2={c2},d1={d1:.2f},d2={d2:.2f}) "
+                      f"-- cap hit or cache artefact; re-run", file=sys.stderr)
+                continue
+            values.append((c2 - c1) / denominator)
+        if values:
+            values.sort()
+            median = values[len(values) // 2]
+            results[name] = values
+            spread = f"{values[0]:.2f}-{values[-1]:.2f}" if len(values) > 1 else "n=1"
+            print(f"  {name:6s} {median:6.2f} tok/s  (n={len(values)}, {spread})")
+        else:
+            print(f"  {name:6s} no valid samples", file=sys.stderr)
+
+    if args.save:
+        current = s.state_dir / "current_run"
+        run_id = args.run or (current.read_text().strip() if current.exists() else None)
+        runs = _ledger(s).list_runs()
+        if run_id and run_id in runs:
+            _ledger(s).append(run_id, metrics={f"bench_{k}": round(sorted(v)[len(v) // 2], 2)
+                                               for k, v in results.items()})
+            print(f"  recorded under run {run_id}")
+        else:
+            print("  not recorded: no matching run id (start with qwen38 start to get one)",
+                  file=sys.stderr)
+    if results:
+        flat = [v for values in results.values() for v in values]
+        print(f"\ncaveat: within one boot, deltas below ~15% are noise on this hardware. "
+              f"Run-to-run spread here is {round((max(flat) - min(flat)) / (sum(flat) / len(flat)) * 100, 1)}%.")
+    return 0 if results else 1
+
+
+def cmd_guard(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Watchdog. Trips by stopping OUR container, never by touching a neighbour."""
+    thresholds = guard.Thresholds(
+        psi_some=s.float("Q38_GUARD_PSI_SOME"),
+        available_floor_gib=s.float("Q38_GUARD_AVAIL_FLOOR_GIB"),
+        strikes=s.int("Q38_GUARD_TRIP_STRIKES"))
+    state = guard.Guard(thresholds)
+    interval = s.int("Q38_GUARD_INTERVAL_S")
+    print(f"guard: PSI some >= {thresholds.psi_some}% or avail < {thresholds.available_floor_gib} GiB "
+          f"for {thresholds.strikes} consecutive {interval}s samples stops {CONTAINER}")
+    samples = 0
+    try:
+        while True:
+            sample = guard.read_sample()
+            verdict, reason = state.decide(sample)
+            samples += 1
+            if verdict != "ok":
+                print(f"[{time.strftime('%H:%M:%S')}] {verdict.upper()}: {reason}", flush=True)
+            if verdict == "trip":
+                _run(["docker", "stop", "-t", "10", CONTAINER], timeout=60)
+                current = s.state_dir / "current_run"
+                if current.exists():
+                    run_id = current.read_text().strip()
+                    if run_id in _ledger(s).list_runs():
+                        _ledger(s).append(run_id, status="failed",
+                                          event={"kind": "guard_trip", "reason": reason})
+                print(f"stopped {CONTAINER} to protect the host; recorded as guard_trip", flush=True)
+                return 2
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print(f"\nguard stopped after {samples} samples")
+        return 0
+
+
+def cmd_compare(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Two runs side by side, config differences first, numbers second.
+
+    Ordering matters: if you read the deltas before the config diff you will
+    believe the number. This prints the diff so a 4% gap stays a 4% gap and does
+    not become a conclusion about a drafter.
+    """
+    ledger = _ledger(s)
+    runs = ledger.list_runs()
+    if args.left not in runs or args.right not in runs:
+        print(f"unknown run. Ledger holds: {', '.join(runs) or '(empty)'}", file=sys.stderr)
+        return 1
+    a, b = ledger.load(args.left), ledger.load(args.right)
+
+    def flat(record: evidence.RunRecord) -> dict:
+        out = {f"plan.{k}": v for k, v in record.plan.items() if k != "docker_argv"}
+        out.update({f"fit.{k}": v for k, v in (record.fit or {}).items()})
+        out.update({f"metric.{k}": v for k, v in record.metrics.items()})
+        return out
+    fa, fb = flat(a), flat(b)
+    keys = sorted(set(fa) | set(fb))
+    diffs = [(k, fa.get(k), fb.get(k)) for k in keys if fa.get(k) != fb.get(k)]
+    print(f"{args.left}  [{a.status}] git {a.git_sha}")
+    print(f"{args.right}  [{b.status}] git {b.git_sha}")
+    if not diffs:
+        print("\nno recorded difference -- these two runs measured the same thing. "
+              "Good: that is a repeatability check, and its spread is your error bar.")
+        return 0
+    print("\nwhat differs:")
+    width = max(len(k) for k, _, _ in diffs) + 1
+    for key, left, right in diffs:
+        print(f"  {key:<{width}s} {left!r} -> {right!r}")
+    metrics = [d for d in diffs if d[0].startswith("metric.")]
+    if metrics:
+        print("\nnumber differences (read the config diff above before trusting these):")
+        for key, left, right in metrics:
+            if isinstance(left, (int, float)) and isinstance(right, (int, float)) and left:
+                pct = (right - left) / left * 100
+                flag = "  <- inside the ~15% noise band" if abs(pct) < 15 else ""
+                print(f"  {key:<{width}s} {left} -> {right}  ({pct:+.1f}%){flag}")
+    return 0
+
+
+def cmd_runs(s: settings.Settings, args: argparse.Namespace) -> int:
+    ledger = _ledger(s)
+    runs = ledger.list_runs()
+    if not runs:
+        print("no runs recorded. `qwen38 start` creates one.")
+        return 0
+    for run_id in runs[-args.tail:]:
+        record = ledger.load(run_id)
+        plan = record.plan
+        metrics = " ".join(f"{k}={v}" for k, v in sorted(record.metrics.items()))
+        print(f"{run_id}  {record.status:8s} {plan.get('profile'):8s} "
+              f"frac={plan.get('mem_fraction_static')} ctx={plan.get('context_length')} "
+              f"c={plan.get('max_running_requests')}  {metrics}")
+    return 0
+
+
+def cmd_config(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Print the effective value of a setting, or the whole table with origins.
+
+    The origins answer the question that actually costs time during tuning: "is
+    the knob I set the knob the engine read?" A value can arrive from the
+    environment, from config.local, or from the defaults, and from the outside
+    the three are indistinguishable. install.sh reads its profile through here
+    rather than re-implementing the precedence rules in sed.
+    """
+    if args.key:
+        try:
+            print(s.get(args.key))
+        except KeyError:
+            print(f"{args.key} is not a known setting", file=sys.stderr)
+            return 1
+        return 0
+    width = max(len(k) for k in s.values) + 1
+    for key in sorted(s.values):
+        origin = s.origins.get(key, "defaults")
+        if origin != "defaults" or args.all:
+            print(f"  {key:<{width}s} {s.values[key]!r:<40s} [{origin}]")
+        else:
+            print(f"  {key:<{width}s} {s.values[key]!r}")
+    return 0
+
+
+NATIVE_CONTEXT = 262144
+
+# One table feeds the header, the command lines and the refusal text, so a
+# printed variable name cannot drift from the one the command actually sets.
+# The third field is the setting the knob writes; "derived" means the value is
+# not a setting at all but a choice the plan builder resolves elsewhere.
+KNOBS = {
+    "profile": (sorted(profiles.PROFILES),
+                "which drafter, and therefore which workload it suits", "Q38_PROFILE"),
+    "concurrency": ([1, 4, 8, 16],
+                    "throughput vs per-stream latency; also sizes the GDN state pool",
+                    "Q38_MAX_CONCURRENT"),
+    "context_length": ([NATIVE_CONTEXT, 524288, 1000000],
+                       "the window you advertise; >262144 needs profile mtp on this build",
+                       "Q38_CONTEXT_LENGTH"),
+    "chunked_prefill": ([2048, 4096, 8192, 16384],
+                        "prefill and TTFT, barely decode", "Q38_CHUNKED_PREFILL"),
+    "reserved_gib": ([8, 16, 24],
+                     "the coexistence dial: your KV pool against the neighbours' safety",
+                     "Q38_RESERVED_GIB"),
+    "dspark_block": ([5, 7],
+                     "draft width; 7 was the measured code peak, 5 trades -16% code for +8% prose",
+                     "Q38_DSPARK_BLOCK"),
+    "spec_steps": ([2, 3, 4],
+                   "MTP chain depth; draft tokens must equal steps+1 at topk 1",
+                   "Q38_SPEC_STEPS"),
+}
+
+
+def _sweep_env(knob: str, value, profile: str) -> str:
+    """The exact env prefix for one sweep step, including its forced companions."""
+    parts = [f"{KNOBS[knob][2]}={value}"]
+    if knob == "spec_steps":
+        # topk=1 chain drafting requires this pairing; a sweep that changes one
+        # without the other boots a config the engine rejects.
+        parts.append(f"Q38_SPEC_DRAFT={int(value) + 1}")
+    if knob in ("context_length", "dspark_block", "spec_steps") and profile == "dflash2":
+        parts.insert(0, "Q38_PROFILE=mtp")
+    return " ".join(parts)
+
+
+def cmd_tune(s: settings.Settings, args: argparse.Namespace) -> int:
+    """Print a sweep plan. Deliberately does not boot anything.
+
+    An automated sweep that can reboot a shared box is a hazard, not a tool. What
+    this gives you is the order to try things in, the control to measure against,
+    and the stopping rule -- which is the part everyone skips and the reason most
+    self-built tuning notes are useless.
+    """
+    if args.knob not in KNOBS:
+        print(f"unknown knob {args.knob!r}. Available: " + ", ".join(sorted(KNOBS)),
+              file=sys.stderr)
+        return 1
+    values, why, env_key = KNOBS[args.knob]
+    profile = args.profile or s.get("Q38_PROFILE")
+
+    print(f"sweep target: {env_key} over {values}")
+    print(f"why it matters: {why}")
+    print(f"current value : {s.get(env_key)}\n")
+
+    if args.knob == "context_length" and profile in ("dspark", "dflash2", "ar"):
+        print(f"note: profile {profile} cannot serve >{NATIVE_CONTEXT}, so the higher "
+              f"values below are shown with Q38_PROFILE=mtp forced in.")
+        print("      Reading this line instead of hitting the refusal at boot is the "
+              "whole point of printing a plan.\n")
+
+    print("protocol -- skipping a step makes the result undatable:")
+    print("  1. one boot per value; never compare across days or across boots")
+    print("     (upstream measured 6.5% inter-boot drift on the same image)")
+    print("  2. discard the first measurement pass after every boot, always")
+    print("  3. interleave A B B A, so thermal and power drift cancels instead of biasing")
+    print("  4. re-run the control (the first value) at the end; if it moved more than")
+    print("     your claimed effect, the sweep measured the box, not the knob")
+    print("  5. treat any delta under ~15% as noise on this hardware\n")
+
+    print("commands:")
+    for value in values:
+        print(f"  # {value}")
+        print(f"  {_sweep_env(args.knob, value, profile)} bin/qwen38 start --no-wait")
+        print("  bin/qwen38 wait --timeout 900 && bin/qwen38 canary")
+        print("  bin/qwen38 bench --repeats 3 --save    # first pass discarded by the harness")
+        print("  bin/qwen38 stop")
+    runs = _ledger(s).list_runs()
+    if len(runs) >= 2:
+        print(f"\ncompare the two you care about:\n  bin/qwen38 compare {runs[-2]} {runs[-1]}")
+    print("\nstopping rule: stop when the median across repeats of this knob varies less")
+    print("than the spread within a single value. Past that point you are fitting noise.")
+    return 0
+
+
+
+# --- argument parsing -----------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="qwen38", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--json", action="store_true", help="machine-readable output where supported")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("doctor", help="check the box before launching (changes nothing)")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("fit", help="solve --mem-fraction-static from this boot")
+    p.add_argument("--no-probe", action="store_true", help="skip the CUDA pool probe")
+    p.add_argument("--timeout", type=int, default=180)
+    p.set_defaults(func=cmd_fit)
+
+    p = sub.add_parser("plan", help="print the exact launch argv")
+    p.add_argument("--profile", choices=sorted(profiles.PROFILES))
+    p.add_argument("--port", type=int)
+    p.add_argument("--context-length", dest="context_length", type=int)
+    p.add_argument("--mem-fraction", dest="mem_fraction", type=float)
+    p.add_argument("--no-probe", dest="no_probe", action="store_true")
+    p.add_argument("--timeout", type=int, default=180)
+    p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("pull", help="check the image pin, optionally pull it")
+    p.add_argument("--pull", action="store_true")
+    p.set_defaults(func=cmd_pull)
+
+    p = sub.add_parser("start", help="fit, check, launch, record")
+    p.add_argument("--profile", choices=sorted(profiles.PROFILES))
+    p.add_argument("--port", type=int)
+    p.add_argument("--context-length", dest="context_length", type=int)
+    p.add_argument("--mem-fraction", dest="mem_fraction", type=float)
+    p.add_argument("--skip-probe", action="store_true", help="fit without measuring the CUDA pool")
+    p.add_argument("--timeout", type=int, default=180)
+    p.add_argument("--boot-timeout", dest="boot_timeout", type=int, default=1200)
+    p.add_argument("--no-wait", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--run-id", dest="run_id")
+    p.add_argument("--allow-pull", dest="allow_pull", action="store_true",
+                   help="let start pull a missing image instead of refusing")
+    p.set_defaults(func=cmd_start)
+
+    # The unit's entry point. Its own subcommand rather than a --settle flag on
+    # start, because waiting for the box to stop moving is only correct for the
+    # boot case: a human at a terminal already knows what is running and wants
+    # an answer now.
+    p = sub.add_parser("service-start", help="settle, then start (used by systemd)")
+    p.add_argument("--allow-pull", dest="allow_pull", action="store_true")
+    p.add_argument("--skip-probe", dest="skip_probe", action="store_true")
+    p.add_argument("--timeout", type=int, default=180)
+    p.add_argument("--boot-timeout", dest="boot_timeout", type=int, default=1200)
+    p.add_argument("--dry-run", dest="dry_run", action="store_true")
+    p.add_argument("--run-id", dest="run_id")
+    p.add_argument("--no-wait", dest="no_wait", action="store_true")
+    p.add_argument("--profile", choices=sorted(profiles.PROFILES))
+    p.add_argument("--port", type=int)
+    p.add_argument("--context-length", dest="context_length", type=int)
+    p.add_argument("--mem-fraction", dest="mem_fraction", type=float)
+    p.set_defaults(func=cmd_service_start)
+
+    p = sub.add_parser("wait", help="block until /health answers")
+    p.add_argument("--run")
+    p.add_argument("--timeout", type=int, default=1200)
+    p.set_defaults(func=cmd_wait)
+
+    p = sub.add_parser("status", help="container, host pressure, ledger tail")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("stop", help="stop and remove our container only")
+    p.add_argument("--grace", type=int, default=20)
+    p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("logs", help="engine log plus the flags-actually-applied grep")
+    p.add_argument("--tail", type=int, default=200)
+    p.add_argument("--follow", action="store_true")
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("canary", help="correctness gate: arithmetic and tool calling")
+    p.set_defaults(func=cmd_canary)
+
+    p = sub.add_parser("bench", help="two-call net-decode tok/s")
+    p.add_argument("--probe", choices=["all", "code", "essay"], default="all")
+    p.add_argument("--repeats", type=int, default=3)
+    p.add_argument("--run")
+    p.add_argument("--save", action="store_true", help="write the medians into the ledger")
+    p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("guard", help="memory-pressure watchdog (foreground)")
+    p.set_defaults(func=cmd_guard)
+
+    p = sub.add_parser("metrics", help="engine counters, each with what it is evidence for")
+    p.set_defaults(func=cmd_metrics)
+
+    p = sub.add_parser("observe", help="append host+engine samples to state/observe.jsonl")
+    p.add_argument("--interval", type=int, default=10)
+    p.set_defaults(func=cmd_observe)
+
+    p = sub.add_parser("compare", help="config diff first, number diff second")
+    p.add_argument("left")
+    p.add_argument("right")
+    p.set_defaults(func=cmd_compare)
+
+    p = sub.add_parser("runs", help="list recorded runs with their configs")
+    p.add_argument("--tail", type=int, default=20)
+    p.set_defaults(func=cmd_runs)
+
+    p = sub.add_parser("config", help="effective config, with where each value came from")
+    p.add_argument("key", nargs="?")
+    p.add_argument("--all", action="store_true", help="show values even at their default")
+    p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("tune", help="print a sweep protocol for one knob")
+    p.add_argument("knob")
+    p.add_argument("--profile", choices=sorted(profiles.PROFILES))
+    p.set_defaults(func=cmd_tune)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    s = settings.load()
+    if getattr(args, "json", False) and args.command not in ("fit", "plan", "pull"):
+        parser.error("--json applies to fit, plan and pull")
+    # `wait` wants the settings object threaded through; everything else takes it
+    # as the first positional.
+    if args.func is cmd_wait:
+        return args.func(argparse.Namespace(**{**vars(args), "s": s}), settings=s)
+    return args.func(s, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

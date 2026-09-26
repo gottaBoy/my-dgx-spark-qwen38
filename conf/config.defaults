@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# qwen38-spark defaults. Single source of truth for every tunable.
+#
+# Precedence (highest first):
+#   1. real shell environment
+#   2. conf/config.local     (gitignored, per-box overrides)
+#   3. this file
+#
+# Every value that differs from an upstream recipe on purpose says why in the
+# comment above it. Those comments are the design record: if you delete one you
+# delete the reason a future reader will not rediscover.
+
+# --- identity / layout -------------------------------------------------------
+Q38_NAMESPACE="qwen38-spark"
+# Runtime artifacts (state, logs, evidence). Derived from the repo root by
+# bin/qwen38; a removal is one directory.
+Q38_STATE_DIR="state"
+# Weights and compile caches stay OUT of the worktree: a 24 GB checkpoint does
+# not belong in a git tree, and this box had no ~/.cache/huggingface at all.
+Q38_CACHE_DIR="~/.cache/qwen38-spark"
+
+# --- ports -------------------------------------------------------------------
+# WHY not 30000/8888: this box already publishes 30000 (ibiz-ebsx-allinone),
+# 30086, 30088, 30250, 30251, 32002, 32003, 32666, and ephemeral sources start
+# at 32768. bin/qwen38 doctor re-probes this at every launch rather than
+# trusting the number below -- a free port is a fact about the box, not about
+# a config file.
+Q38_PORT="28100"
+Q38_STATUS_PORT="28101"
+# WHY loopback by default: MiaAI binds 0.0.0.0 with no auth. On a box that
+# already runs a gateway, a message broker and three databases, an open,
+# unauthenticated inference port is a liability, not a convenience.
+Q38_BIND="127.0.0.1"
+
+# --- image pin ---------------------------------------------------------------
+# Digest, not tag. A tag is a moving pointer, and reproducing a bad measurement
+# is worse than not having made it. bin/qwen38 image-check re-resolves the tag
+# to a digest so a drift shows up as a diff, not as a surprise at 03:00.
+Q38_IMAGE_DIGEST="lmsysorg/sglang@sha256:616a3e97f45191af975896cfa644279096cb31bd408a071c2e99ca7209c3cafe"
+Q38_IMAGE_ALIAS="lmsysorg/sglang:dev-qwen38-27b-dflash2"
+
+# --- model -------------------------------------------------------------------
+Q38_MODEL="RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
+# Revision pin is deliberately empty for the target (the NVFP4 export publishes
+# a single revision today) and set for the draft, which moves. bin/qwen38
+# doctor refuses to start a pinned repo whose revision is unresolvable.
+Q38_MODEL_REVISION=""
+Q38_DRAFT_MODEL="z-lab/Qwen3.8-27B-DFlash2"
+Q38_DRAFT_REVISION="50307d4"
+Q38_SERVED_NAME="qwen3.8-27b"
+
+# --- serving shape -----------------------------------------------------------
+Q38_PROFILE="dflash2"
+Q38_CONTEXT_LENGTH="262144"
+Q38_MAX_CONCURRENT="8"
+Q38_CHUNKED_PREFILL="8192"
+# --- speculative knobs --------------------------------------------------------
+# MTP chain depth. topk=1 requires SPEC_DRAFT == SPEC_STEPS + 1, which the
+# doctor enforces; a sweep that changes steps must change draft tokens too.
+Q38_SPEC_STEPS="3"
+Q38_SPEC_TOPK="1"
+Q38_SPEC_DRAFT="4"
+# DSpark block size (7 measured the code peak; 5 trades -16% code for +8% prose)
+# and the DFlash2 drafted-token count (block 8 == K8).
+Q38_DSPARK_BLOCK="7"
+Q38_DFLASH_TOKENS="8"
+
+# --- the coexistence budget (the reason this repo exists) ---------------------
+# --mem-fraction-static is NOT a constant here. lib/qwen38/memfit.py computes
+# it at launch from MemAvailable, and clamps the result between these bounds.
+#   upstream pins, for reference: MiaAI 0.95 (dedicated), r0b0 0.70, hasso 0.50
+# native / 0.76 for 1M. All four assume the box is theirs. This one is not.
+Q38_MIN_FRACTION="0.45"
+Q38_MAX_FRACTION="0.72"
+# Headroom we refuse to spend, whatever the arithmetic says.
+Q38_RESERVED_GIB="16"
+
+# --- cpu affinity -------------------------------------------------------------
+# WHY "auto" and not "5-9,15-19": the big/LITTLE split is a fact about the SoC,
+# readable from sysfs (scaling_max_freq). lib/qwen38/cpuset.py derives it, and
+# the test suite pins the derivation against a captured sysfs snapshot, so a
+# different Spark revision says so out loud instead of silently mis-pinning.
+Q38_CPUSET="auto"
+
+# --- container bounds --------------------------------------------------------
+# The cgroup does not see CUDA unified allocations, so --memory bounds host RSS
+# only. It is a leak backstop, not the real guard; the real guard is the fitted
+# fraction plus observe/guard.py.
+Q38_CONTAINER_MEM="96g"
+Q38_SHM_SIZE="16g"
+# WHY not --privileged (MiaAI uses it): we need device access and host IPC for
+# the CUDA context, not control of the whole host. Smaller blast radius on a
+# box that also holds other people's databases.
+Q38_PRIVILEGED="0"
+Q38_EXTRA_DOCKER_ARGS=""
+Q38_EXTRA_SERVER_ARGS=""
+
+# --- watchdog thresholds ------------------------------------------------------
+# Trip points sit well inside the danger zone so the guard acts before the
+# kernel OOM killer reaches whichever neighbour happens to be allocating.
+Q38_GUARD_PSI_SOME="25.0"
+Q38_GUARD_AVAIL_FLOOR_GIB="8"
+Q38_GUARD_INTERVAL_S="5"
+# Two consecutive breaches, so a single noisy sample cannot stop a serving
+# engine that is mid-answer for someone else.
+Q38_GUARD_TRIP_STRIKES="2"
+# --- boot settle --------------------------------------------------------------
+# At boot the neighbours are still starting, so MemAvailable is temporarily at
+# its peak. Fitting a fraction at that instant over-asks, and the failure shows
+# up minutes later at CUDA graph capture. These knobs say how long to wait for
+# the number to stop moving before trusting it.
+Q38_SETTLE_INTERVAL_S="10"
+Q38_SETTLE_STABLE_SAMPLES="3"
+Q38_SETTLE_MAX_DRIFT_GIB="2.0"
+# Ceiling, not a target. A box that has not settled by now is doing something we
+# cannot reason about, and service-start refuses rather than guessing.
+Q38_SETTLE_DEADLINE_S="300"

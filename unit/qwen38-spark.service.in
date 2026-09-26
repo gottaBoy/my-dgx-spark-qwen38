@@ -1,0 +1,44 @@
+# Qwen3.8 serving engine, managed by systemd.
+#
+# Rendered by ./install.sh from this template; edit the template, not the copy
+# in /etc/systemd/system. Placeholders are written as an at-sign, a name in
+# capitals, and another at-sign, so a plain substitution is the only logic in
+# the installer -- and so the installer can refuse to ship a unit that still
+# contains one. (Do not write that token literally in this file: the installer
+# greps for it, and a comment mentioning it reads as an unrendered placeholder.)
+#
+# Why a unit at all, when `qwen38 start` works: the box reboots, and an engine
+# that must be remembered is an engine that is quietly down. Note that the
+# fraction is NOT baked in here -- the launcher recomputes it every boot, which
+# is the point of the whole design. A constant in a unit file is a measurement
+# that went stale the day it was written.
+[Unit]
+Description=qwen38-spark: @PROFILE@ on Qwen3.8-27B (SGLang, GB10)
+Documentation=file://@REPO@/README.md
+After=docker.service network-online.target
+Requires=docker.service
+# On a boot the neighbours are starting too, so MemAvailable is temporarily the
+# highest it will ever be. Fitting against that number buys a fraction that is
+# wrong by the time the engine finishes loading -- which is exactly how a
+# documented "hard reboot after graph capture" happens. The settle wait inside
+# service-start is what covers this; it is a correctness delay, not a timeout.
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@REPO@
+# One engine at a time. Idempotent, and `-` means a stale container from a
+# crash is not an error here -- start reads the ledger, not the container name.
+ExecStartPre=-/usr/bin/docker rm -f qwen38-spark
+ExecStart=@REPO@/bin/qwen38 service-start
+ExecStop=@REPO@/bin/qwen38 stop --grace 25
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=30
+# A stop is not a failure. Without this the unit reads "failed" after every
+# deliberate `systemctl stop`, which trains you to ignore the real ones.
+SuccessExitStatus=0 137 143
+
+[Install]
+WantedBy=multi-user.target
