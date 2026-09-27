@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import re
 
 from . import profiles
+from . import rope
 
 
 @dataclass(frozen=True)
@@ -148,6 +149,11 @@ def build(inputs: Inputs) -> Plan:
         "max_concurrent": str(inputs.max_concurrent),
         "mamba_cache_size": str(_mamba_cache_size(inputs.max_concurrent, profile.mamba_slots)),
         "mamba_strategy": profile.mamba_strategy,
+        "full_memory_ratio": f"{profile.full_memory_ratio:g}",
+        # An empty slot drops the flag with it (see _render), which is how a
+        # native boot carries no rope override at all.
+        "rope_override": (rope.override_json(rope.derive_factor(inputs.context_length))
+                          if rope.needs_yarn(inputs.context_length) else ""),
         "mem_fraction": f"{inputs.mem_fraction:.3f}",
         "bind": inputs.bind,
         "port": str(inputs.port),
@@ -226,6 +232,14 @@ def build(inputs: Inputs) -> Plan:
         # hammer other libraries read differently, and one lever that is well
         # understood beats two that are not.
         *(["-e", "HF_HUB_OFFLINE=1"] if inputs.offline else []),
+        # Without this SGLang logs "User-specified context_length is greater than
+        # the derived context_length", ignores --context-length, and serves the
+        # native 262K while the config claims 1M. That is the silent half of the
+        # YaRN recipe; MiaAI passes the same variable, and the granted context_len
+        # in `logs` is what proves it took. Only set when a rope override is there
+        # to authorise it, so a native boot carries neither.
+        *(["-e", "%s=%s" % rope.ALLOW_LONGER_ENV]
+          if rope.needs_yarn(inputs.context_length) else []),
         "-v", f"{inputs.cache_dir}/huggingface:/root/.cache/huggingface",
         "-v", f"{inputs.cache_dir}/triton:/root/.triton",
         "-v", f"{inputs.cache_dir}/inductor:/root/.cache/inductor",

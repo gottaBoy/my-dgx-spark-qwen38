@@ -155,6 +155,52 @@ class TestContextCapability(unittest.TestCase):
             plan_mod.build(inputs(profile=name, context_length=262144))
 
 
+class TestMambaRatioDerivation(unittest.TestCase):
+    """Slots per request come from the engine's own arithmetic, not a guess.
+
+    Pinned from kv_cache_configurator._calculate_mamba_ratio in the image this
+    repo runs: base 3, plus 2 for non-lazy extra_buffer with the overlap
+    scheduler on, plus 1 for lazy. Verified against three boots on the reference
+    box, including the one that granted 6 where 8 were asked.
+    """
+
+    def test_extra_buffer_needs_five_slots_and_lazy_four(self):
+        from qwen38 import profiles
+        self.assertEqual(profiles.MAMBA_RATIO["extra_buffer"], 5)
+        self.assertEqual(profiles.MAMBA_RATIO["extra_buffer_lazy"], 4)
+
+    def test_each_profile_derives_slots_from_its_strategy(self):
+        from qwen38 import profiles
+        for name, profile in profiles.PROFILES.items():
+            self.assertEqual(
+                profile.mamba_slots,
+                profiles.MAMBA_RATIO[profile.mamba_strategy] * profile.mamba_slot_headroom,
+                name)
+
+    def test_dflash2_is_the_one_that_needs_more(self):
+        # It forces extra_buffer, so it pays 5/req. Getting this wrong is what
+        # produced the silent 8 -> 6 clamp measured on this box.
+        from qwen38 import profiles
+        self.assertEqual(profiles.PROFILES["dflash2"].mamba_strategy, "extra_buffer")
+        self.assertGreater(profiles.PROFILES["dflash2"].mamba_slots,
+                           profiles.PROFILES["ar"].mamba_slots)
+
+    def test_the_measured_clamp_is_reproducible_from_the_formula(self):
+        # 32 slots // 5 = 6: exactly what the engine granted when asked for 8.
+        self.assertEqual(32 // profiles.MAMBA_RATIO["extra_buffer"], 6)
+        # 96 // 5 = 19 >= 8: what fixed it.
+        self.assertGreaterEqual(96 // profiles.MAMBA_RATIO["extra_buffer"], 8)
+        # and the lazy boot at 32 was never clamped: 32 // 4 = 8.
+        self.assertEqual(32 // profiles.MAMBA_RATIO["extra_buffer_lazy"], 8)
+
+    def test_plan_sizes_the_pool_from_the_derived_value(self):
+        for name in ("dflash2", "ar"):
+            args = list(plan_mod.build(inputs(profile=name)).server_args)
+            slots = profiles.PROFILES[name].mamba_slots
+            self.assertEqual(args[args.index("--max-mamba-cache-size") + 1],
+                             str(8 * slots), name)
+
+
 class TestGdnPool(unittest.TestCase):
     def test_pool_scales_with_declared_slots_not_with_draft_width(self):
         # Folding the 8-token verify window in over-provisions the pool 2x, and

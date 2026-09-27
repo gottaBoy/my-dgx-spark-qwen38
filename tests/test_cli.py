@@ -13,6 +13,7 @@ import io
 import os
 import re
 import socket
+import tempfile
 import unittest
 import urllib.request
 from pathlib import Path
@@ -189,6 +190,59 @@ class TestMetricParsing(unittest.TestCase):
             self.assertTrue(name.startswith("sglang:"), name)
 
 
+class TestStopIntentMarker(unittest.TestCase):
+    """The marker's lifecycle, which is the only thing separating a stop from a crash.
+
+    Written by stop and by the guard, cleared by start -- and *not* by the writer.
+    A marker deleted on the way out would leave the supervisor reading an absent
+    file and grading a deliberate stop as a crash, restarting the engine the
+    operator just stopped.
+    """
+
+    def _fake(self, tmp):
+        import types
+        return types.SimpleNamespace(state_dir=Path(tmp))
+
+    def test_mark_survives_the_caller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self._fake(tmp)
+            cli._mark_stop_intended(s)
+            self.assertTrue(cli._stop_is_intended(s), "marker must outlive the writer")
+
+    def test_unmarked_box_reads_as_not_intended(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(cli._stop_is_intended(self._fake(tmp)))
+
+    def test_start_clears_a_marker_left_by_a_previous_run(self):
+        # The stale-marker hazard: one stop makes every later crash look deliberate.
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self._fake(tmp)
+            cli._mark_stop_intended(s)
+            cli._intent_path(s).unlink(missing_ok=True)      # what cmd_start does
+            self.assertFalse(cli._stop_is_intended(s))
+
+    def test_marker_is_written_before_the_container_is_touched(self):
+        """Order matters: writing it after the stop leaves a window in which a
+        killed supervisor sees a dead container and no marker, i.e. a crash."""
+        src = (_ROOT / "bin" / "qwen38").read_text()
+        body = src[src.index("def cmd_stop"):src.index("def cmd_metrics")]
+        self.assertLess(body.index("_mark_stop_intended"),
+                        body.index('docker", "stop"'),
+                        "intent must be recorded before docker stop runs")
+
+    def test_guard_marks_intent_before_it_stops_the_engine(self):
+        # Same ordering rule as cmd_stop, for the same reason: if the trip stopped
+        # first and marked second, a supervisor already dead would have graded the
+        # trip as a crash and systemd would relaunch the engine straight back into
+        # the memory pressure that just triggered it -- the watchdog undoing itself.
+        src = (_ROOT / "bin" / "qwen38").read_text()
+        body = src[src.index("def cmd_guard"):src.index("def cmd_compare")]
+        self.assertIn("_mark_stop_intended(s)", body)
+        self.assertLess(body.index("_mark_stop_intended(s)"),
+                        body.index('docker", "stop"'),
+                        "guard must record intent before it stops the container")
+
+
 class TestHelpSurface(unittest.TestCase):
     @classmethod
     def _command_names(cls) -> list[str]:
@@ -260,6 +314,11 @@ class TestHelpSurface(unittest.TestCase):
                 # path, not advice to a human. Skipping them keeps the rule about
                 # what the tool tells people to type.
                 if line.lstrip().startswith(("from ", "import ")):
+                    continue
+                # A deliberate, greppable exemption for prose that *quotes* a dead
+                # command while explaining why it was wrong. Suppressions must be
+                # visible in the file they excuse, not in a list nobody reads.
+                if "name-check:ignore" in line:
                     continue
                 for match in pattern.finditer(line):
                     word = match.group(1)

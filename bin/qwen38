@@ -27,7 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 from qwen38 import cpuset as cpuset_mod
 from qwen38 import (evidence, guard, memfit, plan as plan_mod, ports, profiles,
-                    hfcache, imageport, net, pins, settings, settle)
+                    granted as granted_mod, hfcache, imageport, net, pins,
+                    settings, settle)
 
 # The download itself needs huggingface_hub, which is not stdlib and so is not a
 # dependency of this CLI. Two candidate interpreters are probed rather than
@@ -187,6 +188,29 @@ def _http_ok(port: int, path: str = "/health", timeout: float = 5.0) -> bool:
 
 def _ledger(s: settings.Settings) -> evidence.Ledger:
     return evidence.Ledger(s.evidence_dir())
+
+
+def _intent_path(s: settings.Settings) -> Path:
+    return s.state_dir / "stop-intended"
+
+
+def _mark_stop_intended(s: settings.Settings) -> None:
+    """Record that the container's disappearance was asked for.
+
+    Written by whoever stops the container and cleared by the *next start*, not by
+    the stopper. The reader is a different process -- the supervisor tailing the
+    engine's log -- and it has to tell "someone asked for this" apart from "the
+    engine died". A marker the writer deletes on the way out is a note nobody can
+    read, and the supervisor would restart an engine the operator just stopped.
+    """
+    path = _intent_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n",
+                    encoding="utf-8")
+
+
+def _stop_is_intended(s: settings.Settings) -> bool:
+    return _intent_path(s).exists()
 
 
 # --- commands ------------------------------------------------------------------
@@ -559,6 +583,11 @@ def cmd_start(s: settings.Settings, args: argparse.Namespace) -> int:
     root = s.root
     if args.dry_run:
         return _start_dry_run(s, args)
+    # Clear any intent left by an earlier run. A marker that survived a crash
+    # belongs to the previous container; honouring it here would let the
+    # supervisor grade the next unrequested death as a deliberate stop and let the
+    # unit quietly stay down.
+    _intent_path(s).unlink(missing_ok=True)
 
     # The image must already be local. `docker run` on a missing digest starts an
     # implicit pull of ~14 GB, which is a decision about disk and bandwidth this
@@ -758,10 +787,18 @@ def cmd_service_start(s: settings.Settings, args: argparse.Namespace) -> int:
     # output in the journal, so `journalctl -u qwen38-spark` needs no second
     # command. systemd stops us with SIGTERM, we exit, and ExecStop runs
     # `qwen38 stop`, which is the ordering we want.
-    return _follow_engine_logs()
+    return _follow_engine_logs(s)
 
 
-def _follow_engine_logs() -> int:
+def _follow_engine_logs(s: settings.Settings) -> int:
+    """Stay alive while the engine is, then grade why it stopped.
+
+    Under `systemctl stop` this never runs to completion: systemd SIGTERMs the
+    process (143, which SuccessExitStatus forgives) and runs ExecStop. Reaching
+    the code below means the container vanished while we were still watching, so
+    the only two possibilities are an unsupervised stop or a death -- and the
+    intent marker is the one thing that tells them apart.
+    """
     print(f"engine ready; following {CONTAINER} logs into the journal (Ctrl+C detaches)",
           flush=True)
     try:
@@ -769,14 +806,15 @@ def _follow_engine_logs() -> int:
     except KeyboardInterrupt:
         # A human on the terminal; under systemd this path is SIGTERM, not this.
         return 0
-    # The follow also ends when the container stops, and that must not read as a
-    # success: exiting 0 here leaves the unit "inactive" next to a crashed engine
-    # and Restart=on-failure never fires. That is the one failure shape in this
-    # design that would go unnoticed, so it is graded as a failure.
-    if CONTAINER in _run(["docker", "ps", "--format", "{{.Names}}"]).stdout.split():
-        return 0
-    print(f"{CONTAINER} stopped; exiting non-zero so systemd restarts it", file=sys.stderr)
-    return 1
+    running = CONTAINER in _run(["docker", "ps", "--format", "{{.Names}}"]).stdout.split()
+    code = granted_mod.follow_exit_code(running, _stop_is_intended(s))
+    if code:
+        # Exiting 0 for a crash is the failure shape this whole function exists
+        # to prevent: the unit reads "inactive" beside a dead engine and
+        # Restart=on-failure never fires.
+        print(f"{CONTAINER} died unasked; exiting non-zero so systemd restarts it",
+              file=sys.stderr)
+    return code
 
 
 def cmd_status(s: settings.Settings, args: argparse.Namespace) -> int:
@@ -805,7 +843,12 @@ def cmd_status(s: settings.Settings, args: argparse.Namespace) -> int:
 
 
 def cmd_stop(s: settings.Settings, args: argparse.Namespace) -> int:
-    """Stop and remove OUR container only. Never enumerates a neighbour's."""
+    """Stop and remove OUR container only. Never enumerates a neighbour's.
+
+    Intent is recorded before anything is touched, and deliberately not cleaned up
+    afterwards -- see _mark_stop_intended for why the writer must not delete it.
+    """
+    _mark_stop_intended(s)
     proc = _run(["docker", "stop", "-t", str(args.grace), CONTAINER], timeout=args.grace + 60)
     if proc.returncode != 0:
         print(proc.stderr.strip()[:300], file=sys.stderr)
@@ -930,15 +973,53 @@ def cmd_logs(s: settings.Settings, args: argparse.Namespace) -> int:
     proc = _run(["docker", "logs", "--tail", str(args.tail), CONTAINER], timeout=60)
     sys.stdout.write(proc.stdout)
     sys.stderr.write(proc.stderr[-4000:] if proc.stderr else "")
-    # The one grep that answers "did the flags I asked for actually take effect",
-    # which is the single most common silent failure across all three upstream repos.
-    for pattern in ("speculative_algorithm=", "max_running_requests=", "max_mamba_cache_size=",
-                    "context_len=", "KV cache pool tokens"):
-        for line in (proc.stdout + proc.stderr).splitlines():
-            if pattern in line:
-                print(f"  effect: {line.strip()[:160]}")
-                break
+    # "Did the flags I asked for take effect" is the most common silent failure in
+    # this space. Echoing log lines is not an answer: the engine prints both what
+    # it was handed and what it decided, and leaves a human to diff them. So diff
+    # them, over a wider window than the excerpt -- the two lines sit roughly a
+    # thousand lines apart in a real boot.
+    _report_granted(s, _engine_log(args.all))
     return proc.returncode
+
+
+def _engine_log(all_lines: bool) -> str:
+    """The container's log, both streams, as one string to search.
+
+    Both streams because SGLang writes its startup banner to stderr; reading only
+    stdout finds nothing and a comparison then looks clean for the wrong reason.
+    The default window is wider than any excerpt on purpose -- see cmd_logs.
+    """
+    argv = ["docker", "logs"] + ([] if all_lines else ["--tail", "20000"]) + [CONTAINER]
+    proc = _run(argv, timeout=120)
+    return proc.stdout + proc.stderr
+
+
+def _report_granted(s: settings.Settings, text: str) -> None:
+    """Print asked-versus-granted for the limits the engine is allowed to resize."""
+    requested = granted_mod.parse_requested(text)
+    actual = granted_mod.parse_granted(text)
+    if not actual:
+        # "Nothing to compare yet" is the honest output. Falling through to an
+        # empty report reads as agreement, which is worse than no report.
+        print("  effect: no pool-sizing line in the log yet. The engine has not "
+              "finished allocating, so nothing here is verified.", file=sys.stderr)
+        return
+    print()
+    deltas = granted_mod.compare(requested, actual)
+    for delta in deltas:
+        print(f"  effect: {delta.render()}")
+    for key in granted_mod.missing_checks(requested, actual, deltas):
+        print(f"  effect: unchecked {key} (absent from one of the two lines; a "
+              "rename or a truncated log -- do not read this as agreement)")
+    pool = actual.get("max_total_num_tokens")
+    if pool:
+        context = max(1, s.int("Q38_CONTEXT_LENGTH"))
+        print(f"  effect: KV pool {int(pool):,} tokens = "
+              f"{int(pool) // context} full {context}-token sequences")
+    room = granted_mod.headroom(actual)
+    if room:
+        print(f"  effect: {room} GB left on the unified pool after capture "
+              "(this, not the container's RSS, is the GB10 margin)")
 
 
 def cmd_canary(s: settings.Settings, args: argparse.Namespace) -> int:
@@ -1091,6 +1172,12 @@ def cmd_guard(s: settings.Settings, args: argparse.Namespace) -> int:
             if verdict != "ok":
                 print(f"[{time.strftime('%H:%M:%S')}] {verdict.upper()}: {reason}", flush=True)
             if verdict == "trip":
+                # Mark intent first. A trip that stopped the engine and marked it
+                # afterwards leaves a window where the supervisor sees a dead
+                # container with no marker, grades it a crash, and has systemd
+                # relaunch the engine straight into the pressure that just
+                # triggered the trip -- the watchdog undoing itself.
+                _mark_stop_intended(s)
                 _run(["docker", "stop", "-t", "10", CONTAINER], timeout=60)
                 current = s.state_dir / "current_run"
                 if current.exists():
@@ -1377,6 +1464,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("logs", help="engine log plus the flags-actually-applied grep")
     p.add_argument("--tail", type=int, default=200)
     p.add_argument("--follow", action="store_true")
+    p.add_argument("--all", action="store_true",
+                   help="read the whole log for the asked-vs-granted comparison")
     p.set_defaults(func=cmd_logs)
 
     p = sub.add_parser("canary", help="correctness gate: arithmetic and tool calling")
