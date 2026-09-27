@@ -36,6 +36,7 @@ class HostMemory:
 
     total_gib: float
     available_gib: float
+    swap_used_gib: float = 0.0
 
     @classmethod
     def from_meminfo(cls, text: str) -> "HostMemory":
@@ -51,9 +52,12 @@ class HostMemory:
         try:
             total = vals["MemTotal"]
             avail = vals["MemAvailable"]
+            swap_total = vals.get("SwapTotal", 0)
+            swap_free = vals.get("SwapFree", swap_total)
         except KeyError as exc:  # pragma: no cover - malformed /proc
             raise ValueError(f"/proc/meminfo missing {exc}") from None
-        return cls(round(total * KIB / GIB, 2), round(avail * KIB / GIB, 2))
+        return cls(round(total * KIB / GIB, 2), round(avail * KIB / GIB, 2),
+                   round(max(0, swap_total - swap_free) * KIB / GIB, 2))
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,7 @@ class Fit:
     bound_by: str
     clamped: bool = False
     warnings: tuple[str, ...] = ()
+    swap_used_gib: float = 0.0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -88,6 +93,7 @@ def solve(
     min_fraction: float,
     max_fraction: float,
     cuda_total_source: str = "measured",
+    swap_ceiling_gib: float = 2.0,
 ) -> Fit:
     """Fit a static-memory fraction to what this box can actually give.
 
@@ -95,9 +101,23 @@ def solve(
     not silently substitute a guess: the caller gets max_fraction with a loud
     warning, which is the behaviour of every other recipe, but now it is
     labelled as the fallback rather than presented as knowledge.
+
+    swap_ceiling_gib is diagnostic, not a second allocation charge. Swap can
+    retain inactive pages long after pressure has subsided; usage alone does
+    not prove current paging. Correlate it with vmstat si/so and PSI when
+    interpreting a benchmark.
     """
     warnings: list[str] = []
     askable = round(host.available_gib - reserved_gib, 2)
+
+    # Swap usage can persist after pressure subsides. Treat it as a diagnostic,
+    # not a second charge on the operator's reservation or proof of active I/O.
+    if host.swap_used_gib > swap_ceiling_gib:
+        warnings.append(
+            f"{host.swap_used_gib:.1f} GiB in swap (ceiling {swap_ceiling_gib} GiB). "
+            "Check vmstat si/so and PSI for active paging before comparing tok/s. "
+            "Swap usage alone does not prove current pressure; not charged again."
+        )
 
     if cuda_total_gib is None or cuda_total_gib <= 0:
         # Unknown denominator: fall back to the ceiling and say so.
@@ -110,7 +130,8 @@ def solve(
             askable_gib=askable,
             bound_by="fallback",
             clamped=True,
-            warnings=(
+            swap_used_gib=host.swap_used_gib,
+            warnings=tuple(warnings) + (
                 "CUDA pool size not measured; using the configured ceiling "
                 f"{max_fraction}. Run `qwen38 fit` on the box (without --no-probe) "
                 "to measure the pool through the pinned image.",
@@ -128,6 +149,7 @@ def solve(
             askable_gib=askable,
             bound_by="no-headroom",
             clamped=True,
+            swap_used_gib=host.swap_used_gib,
             warnings=(
                 f"MemAvailable {host.available_gib} GiB is at or under the "
                 f"{reserved_gib} GiB reservation. Refusing to launch: free some "
@@ -143,11 +165,11 @@ def solve(
     if fraction > max_fraction:
         fraction, bound_by, clamped = max_fraction, "max_fraction", True
     elif fraction < min_fraction:
-        fraction, bound_by, clamped = min_fraction, "min_fraction", True
+        fraction, bound_by, clamped = 0.0, "no-headroom", True
         warnings.append(
-            f"Budget wants {raw:.3f}; pinned to the {min_fraction} floor. The "
-            "engine may fail to allocate a usable KV pool at this fraction -- "
-            "stop a neighbour or raise Q38_MAX_FRACTION on a box you own."
+            f"Budget wants {raw:.3f}, below the {min_fraction} floor. Refusing "
+            "to launch: clamping upward would spend reserved neighbour memory. "
+            "Wait for sufficient host headroom."
         )
     else:
         # Floor, never round. The fraction multiplies back into an allocation,
@@ -167,6 +189,7 @@ def solve(
         bound_by=bound_by,
         clamped=clamped,
         warnings=tuple(warnings),
+        swap_used_gib=host.swap_used_gib,
     )
 
 

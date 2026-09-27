@@ -1,0 +1,5 @@
+# Shared-host acceptance baseline. Copy the selected settings to config.local;
+# never overwrite an existing config.local during an upgrade.
+Q38_CONTEXT_LENGTH="131072"
+Q38_MAX_FRACTION="0.50"
+Q38_RESERVED_GIB="32"

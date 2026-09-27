@@ -87,24 +87,33 @@ class Guard:
     strikes: int = 0
     tripped_reasons: list[str] = field(default_factory=list)
 
-    def decide(self, sample: Sample) -> tuple[str, str]:
+    def decide(self, sample: Sample, *, ready: bool = True) -> tuple[str, str]:
         """Return (verdict, reason) where verdict is ok | warn | trip.
 
         PSI alone is not enough: a box can sit at 0 pressure with 200 MB left
         right up until it dies, because pressure only appears once tasks are
         already stalled. The absolute floor catches that case, which is why both
-        signals run on every sample.
+        signals run on every sample after readiness. Before the first healthy
+        response, compilation/reclaim PSI is diagnostic only; the absolute
+        MemAvailable floor still trips, including during boot.
         """
         reasons: list[str] = []
         if sample.psi_full_avg10 >= self.thresholds.psi_full:
             reasons.append(f"PSI full avg10 {sample.psi_full_avg10:.1f}%")
         if sample.psi_some_avg10 >= self.thresholds.psi_some:
             reasons.append(f"PSI some avg10 {sample.psi_some_avg10:.1f}%")
+        if not ready:
+            boot_psi = "; ".join(reasons)
+            reasons.clear()
+        else:
+            boot_psi = ""
         if sample.available_gib < self.thresholds.available_floor_gib:
             reasons.append(f"MemAvailable {sample.available_gib:.1f} GiB below floor")
 
         if not reasons:
             self.strikes = 0
+            if boot_psi:
+                return "warn", f"{boot_psi} (boot: PSI diagnostic only; available-memory floor active)"
             return "ok", ""
 
         self.strikes += 1

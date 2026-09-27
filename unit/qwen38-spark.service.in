@@ -28,6 +28,7 @@ Type=simple
 User=@USER@
 Group=@GROUP@
 WorkingDirectory=@REPO@
+Environment=PYTHONUNBUFFERED=1
 # One engine at a time. Idempotent, and `-` means a stale container from a
 # crash is not an error here -- start reads the ledger, not the container name.
 ExecStartPre=-/usr/bin/docker rm -f qwen38-spark

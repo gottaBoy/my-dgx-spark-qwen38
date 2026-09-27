@@ -99,11 +99,42 @@ addition: it waits for host memory to stop moving before it fits a fraction.
 
 ```bash
 ./install.sh --no-service
-./bin/qwen38 start
+./bin/qwen38 guard          # separate foreground terminal, including boot
+./bin/qwen38 start          # another terminal
 ```
 
 Same fitted fraction, same port probe, same ledger entry. The difference is that
 nobody restarts it when the box does.
+
+### User systemd (the current reference deployment)
+
+For this shared host, the administrator's password is not available. The same
+unit can instead be installed in the current user's manager:
+
+```bash
+./install.sh --user --print-unit
+./install.sh --user
+loginctl enable-linger "$USER"
+systemctl --user start qwen38-spark
+journalctl --user -u qwen38-spark -f
+./bin/qwen38 wait --timeout 1200
+./bin/qwen38 canary
+```
+
+Verify `loginctl show-user "$USER" -p Linger` reports `Linger=yes`; without this,
+the enabled user unit does not guarantee boot without login. Enabling linger
+can require administrator approval. Never install both the system and user
+units for the same container.
+
+The current box uses `Q38_CONTEXT_LENGTH=131072`,
+`Q38_MAX_FRACTION=0.50`, and `Q38_RESERVED_GIB=32`. The tracked shared-host
+example lists these values; `conf/config.local` owns the actual host overrides.
+The 262K default is not an acceptance claim for a small memory pool.
+`mem-fraction-static` describes a serving budget, not the checkpoint's size:
+25.72 GiB of cached weights does not include KV/state, graphs and workspaces.
+
+`systemctl ... start` returning successfully means the supervisor started,
+not that model loading has finished. Wait for `/health` and pass `canary`.
 
 ## 2. Accept it (do not skip this step)
 
@@ -114,8 +145,7 @@ believe any number that comes after it:
 ./bin/qwen38 canary
 ```
 
-Shape of the output, from a run against a live engine (this repo has not booted
-one yet, so the strings are illustrative and the pass criteria are real):
+Shape of the output (truncated; use the current run's actual result):
 
 ```
   PASS arithmetic greedy     '437'
@@ -197,8 +227,7 @@ carries the counters under the identical keys `metrics` prints:
  "sglang:num_running_reqs": 3, "t": "..."}
 ```
 
-The second block is illustrative of the keys and not yet a measurement: this repo
-has not booted an engine on the reference box, so its numbers are placeholders.
+The second block is illustrative of the keys, not an actual sample.
 A gap in the file is an honest record of a gap; a zero would be a fabricated
 reading.
 
@@ -214,10 +243,19 @@ Three things to look at, in this order:
    leak. This is the number to alert on, because on GB10 it is the only one that
    reflects GPU memory too.
 
-`guard` is the active half of the same information: it samples host pressure, and
-after two consecutive breaches it stops *our* container and records a `guard_trip`
-event in the ledger. It never touches another container. Run it in the foreground
-while you are learning; once the numbers stop moving, put it in a unit.
+`guard` is the active half of the same information. Before the first healthy
+response, compilation/reclaim PSI produces warnings only; the absolute
+MemAvailable floor still stops the container after consecutive breaches.
+After readiness, both `Q38_GUARD_PSI_SOME` and `Q38_GUARD_PSI_FULL` are active.
+Readiness is latched: an unhealthy response during serving does not disable
+PSI protection. A trip stops *our* container and records `guard_trip`, including
+during boot. The service starts and cleans up this watchdog itself, and does
+not restart into a guard trip.
+
+Old swap usage alone is not proof of current pressure. Check `vmstat 1 3`
+(`si`/`so`, excluding the first since-boot average) together with PSI before
+attributing a throughput drop to paging. Do not use `swapoff` to clear a
+measurement: bringing pages back can disrupt neighbouring services.
 
 ## 5. Upgrading
 
@@ -257,17 +295,24 @@ ask. When it has:
 
 ```bash
 git fetch && git log --oneline HEAD..origin/main
-git pull
-python3 -m unittest discover -s tests -t .    # must be green before you restart anything
-./install.sh --print-unit                     # see whether the unit changed
-./install.sh
-sudo systemctl restart qwen38-spark
+git status --short                           # preserve uncommitted work first
+git rev-parse HEAD                           # record the known-good revision
+systemctl --user stop qwen38-spark            # only our service, before replacing code
+git pull --ff-only
+PYTHONPATH=lib python3 -m unittest discover -s tests -v
+./install.sh --user --print-unit
+./install.sh --user
+systemctl --user start qwen38-spark
+./bin/qwen38 wait --timeout 1200
 ./bin/qwen38 canary
+./bin/qwen38 bench --save
 ```
 
 `install.sh` re-reads what is already installed and keeps your `conf/config.local`
 choices, so an upgrade does not reset a tuned box to its defaults. It backs up a
 unit it is about to replace instead of overwriting a hand edit.
+For a system-level install, omit `--user` from the installer and use
+`sudo systemctl` instead. Do not switch managers as an incidental upgrade.
 
 ### 5.3 The checkpoints
 
@@ -279,7 +324,11 @@ acceptance, which shows up as a slow server with no error anywhere.
 
 ### 5.4 Rollback
 
-`git checkout <sha> && ./install.sh` puts the previous unit back. The ledger keeps
+On a clean worktree, stop our service, use `git switch --detach <known-good-sha>`,
+reinstall into the same manager, start, wait, and repeat canary/bench. Preserve
+any uncommitted work before changing revisions; never use a force checkout to
+discard it. Restore the known-good image and model pins as well if changed.
+The ledger keeps
 the old run records, so `compare <old-run> <new-run>` tells you whether the
 rollback achieved anything. This is the reason the ledger stores the whole plan
 per run rather than a diff against "current": the current changes.
@@ -293,7 +342,7 @@ per run rather than a diff against "current": the current changes.
 | Container exits before ready | `qwen38 logs --tail 200` | Read the traceback; the two common ones are a fraction too high for the KV pool, and a draft revision that no longer matches |
 | Unit says `inactive`, engine answers anyway | did you run `start` manually instead of the service? | Two managers for one container. `qwen38 stop` then `systemctl start` |
 | Slow, no errors | `qwen38 metrics` | Look at `accept_length` then `kv_usage`. See the curriculum, step 3 |
-| Box froze and needed a power cycle | `journalctl -k -b -1` | Not this stack's guard being insufficient -- check whether something was started outside it with a hand-set fraction |
+| Box froze and needed a power cycle | `journalctl -k -b -1` | Review guard logs, startup budget and other allocations. A watchdog is a best-effort protection, not an OOM guarantee |
 
 The ledger is the debugging tool. `qwen38 runs` shows each run's status; a run
 stuck at `open` is a boot that never became ready, and its `plan` is the exact
@@ -306,6 +355,8 @@ configuration that failed. That is worth more than reproducing from memory.
 ./uninstall.sh            # unit + container; caches and ledger stay
 ./uninstall.sh --purge    # also delete ~24 GB of weights
 ```
+
+For the current user installation, add `--user` to each uninstall command.
 
 The run ledger under `state/evidence` is never deleted by either mode. It is the
 measurement record, and it is the one artifact here you cannot regenerate.

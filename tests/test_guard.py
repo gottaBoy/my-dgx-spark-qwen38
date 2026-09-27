@@ -103,6 +103,33 @@ class TestTripLogic(unittest.TestCase):
         _, reason = state.decide(guard.Sample(0.0, 0.0, 1.0))
         self.assertIn("MemAvailable", reason)
 
+    def test_boot_psi_warns_without_accumulating_trip_strikes(self):
+        state = guard.Guard(guard.Thresholds(**self.KW))
+        for _ in range(10):
+            verdict, reason = state.decide(guard.Sample(40.0, 7.0, 99.0), ready=False)
+            self.assertEqual(verdict, "warn")
+            self.assertIn("boot", reason)
+            self.assertEqual(state.strikes, 0)
+
+    def test_boot_available_floor_still_trips(self):
+        state = guard.Guard(guard.Thresholds(**self.KW))
+        self.assertEqual(state.decide(guard.Sample(40.0, 7.0, 2.0), ready=False)[0], "warn")
+        verdict, reason = state.decide(guard.Sample(40.0, 7.0, 2.0), ready=False)
+        self.assertEqual(verdict, "trip")
+        self.assertIn("MemAvailable", reason)
+
+    def test_ready_phase_does_not_inherit_boot_psi_strikes(self):
+        state = guard.Guard(guard.Thresholds(**self.KW))
+        sample = guard.Sample(40.0, 7.0, 99.0)
+        state.decide(sample, ready=False)
+        self.assertEqual(state.decide(sample, ready=True)[0], "warn")
+        self.assertEqual(state.decide(sample, ready=True)[0], "trip")
+
+    def test_full_threshold_is_configurable(self):
+        state = guard.Guard(guard.Thresholds(psi_full=10.0))
+        self.assertEqual(state.decide(guard.Sample(0.0, 7.0, 99.0))[0], "ok")
+        self.assertEqual(state.decide(guard.Sample(0.0, 10.0, 99.0))[0], "warn")
+
 
 class TestReadSample(unittest.TestCase):
     def test_reads_supplied_paths(self):

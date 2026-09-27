@@ -17,6 +17,10 @@ class TestParsing(unittest.TestCase):
         self.assertAlmostEqual(host.total_gib, 119.67, places=2)
         self.assertAlmostEqual(host.available_gib, 90.45, places=1)
 
+    def test_swap_is_parsed_in_gib(self):
+        host = memfit.HostMemory.from_meminfo(fixtures.MEMINFO_HEALTHY)
+        self.assertAlmostEqual(host.swap_used_gib, (16777212 - 13096264) / 1024**2, places=2)
+
     def test_starved_box_reads_small_not_zero(self):
         host = memfit.HostMemory.from_meminfo(fixtures.MEMINFO_STARVED)
         self.assertAlmostEqual(host.available_gib, 2.0, places=1)
@@ -75,12 +79,13 @@ class TestSolve(unittest.TestCase):
         fit = memfit.solve(memfit.HostMemory(119.67, 90.0), 0, reserved_gib=16, **self.KW)
         self.assertEqual(fit.bound_by, "fallback")
 
-    def test_floor_clamp_warns_that_the_engine_may_not_fit(self):
+    def test_below_floor_refuses_instead_of_spending_reserved_headroom(self):
         # 30 available, 16 reserved, 119.7 pool -> 0.117, below the floor.
         fit = memfit.solve(memfit.HostMemory(119.67, 30.0), 119.7, reserved_gib=16, **self.KW)
-        self.assertEqual(fit.fraction, 0.45)
-        self.assertEqual(fit.bound_by, "min_fraction")
+        self.assertEqual(fit.fraction, 0.0)
+        self.assertEqual(fit.bound_by, "no-headroom")
         self.assertTrue(any("floor" in w for w in fit.warnings))
+        self.assertTrue(any("Refusing" in w for w in fit.warnings))
 
     def test_rounding_cannot_silently_exceed_the_budget(self):
         host = memfit.HostMemory(119.67, 90.45)
@@ -94,6 +99,13 @@ class TestSolve(unittest.TestCase):
         for key in ("fraction", "cuda_total_gib", "available_gib", "reserved_gib",
                     "askable_gib", "bound_by"):
             self.assertIn(key, fit)
+
+    def test_old_swap_is_reported_without_reducing_the_budget(self):
+        plain = memfit.solve(memfit.HostMemory(119.67, 90.0), 119.7, reserved_gib=32, **self.KW)
+        swapped = memfit.solve(memfit.HostMemory(119.67, 90.0, 12.0), 119.7, reserved_gib=32, **self.KW)
+        self.assertEqual(plain.fraction, swapped.fraction)
+        self.assertEqual(swapped.swap_used_gib, 12.0)
+        self.assertTrue(any("si/so" in warning for warning in swapped.warnings))
 
 
 class TestCudaProbeParsing(unittest.TestCase):

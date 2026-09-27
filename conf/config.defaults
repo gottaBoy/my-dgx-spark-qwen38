@@ -79,14 +79,31 @@ Q38_DSPARK_BLOCK="7"
 Q38_DFLASH_TOKENS="8"
 
 # --- the coexistence budget (the reason this repo exists) ---------------------
-# --mem-fraction-static is NOT a constant here. lib/qwen38/memfit.py computes
-# it at launch from MemAvailable, and clamps the result between these bounds.
+# lib/qwen38/memfit.py computes --mem-fraction-static from MemAvailable,
+# caps it at the ceiling, and refuses budgets below the configured floor.
 #   upstream pins, for reference: MiaAI 0.95 (dedicated), r0b0 0.70, hasso 0.50
 # native / 0.76 for 1M. All four assume the box is theirs. This one is not.
 Q38_MIN_FRACTION="0.45"
 Q38_MAX_FRACTION="0.72"
 # Headroom we refuse to spend, whatever the arithmetic says.
-Q38_RESERVED_GIB="16"
+#
+# Prior reference boots show the tradeoff:
+#   reserved 16 -> fraction 0.689 -> static budget 82.5 GiB, available fell to
+#     26 GiB, swap grew 3.7 -> 11.9 GiB, and code throughput fell from 47.05
+#     to 35.76 tok/s. Swap occupancy alone does not establish the cause.
+#   reserved 40 -> fraction 0.498 -> KV pool 231,756 tokens, too small to hold a
+#     single 262144-token sequence.
+#
+# 32 GiB is an operator-selected launch margin for this shared host, not a
+# proven universal threshold. Existing swapped-out pages may become active,
+# and neighbouring allocations can grow after launch; the watchdog still
+# matters. The accepted shared profile additionally caps the fraction at 0.50
+# and uses 128K context (conf/config.shared.example).
+#
+# CUDA unified allocations are not fully visible in container cgroup RSS.
+# Host MemAvailable reflects system-wide headroom, but its before/after change
+# is not exact attribution to this engine when other workloads are active.
+Q38_RESERVED_GIB="32"
 
 # --- cpu affinity -------------------------------------------------------------
 # WHY "auto" and not "5-9,15-19": the big/LITTLE split is a fact about the SoC,
@@ -112,6 +129,7 @@ Q38_EXTRA_SERVER_ARGS=""
 # Trip points sit well inside the danger zone so the guard acts before the
 # kernel OOM killer reaches whichever neighbour happens to be allocating.
 Q38_GUARD_PSI_SOME="25.0"
+Q38_GUARD_PSI_FULL="5.0"
 Q38_GUARD_AVAIL_FLOOR_GIB="8"
 Q38_GUARD_INTERVAL_S="5"
 # Two consecutive breaches, so a single noisy sample cannot stop a serving

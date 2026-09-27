@@ -3,6 +3,7 @@
 #
 #   ./install.sh                  # engine + systemd unit + guard
 #   ./install.sh --no-service     # repo only; run with ./bin/qwen38 start
+#   ./install.sh --user           # current user's systemd manager; no sudo
 #   ./install.sh --profile=mtp    # pick the serving profile to install
 #   ./install.sh --print-unit     # render the unit and exit; touches nothing
 #
@@ -20,11 +21,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_NAME="qwen38-spark"
 SERVICE=1
+USER_SERVICE=0
 PROFILE=""
 
 for arg in "$@"; do
   case "$arg" in
     --no-service) SERVICE=0 ;;
+    --user)       USER_SERVICE=1 ;;
     --print-unit) PRINT_UNIT=1 ;;
     --profile)    { echo "--profile needs =value, e.g. --profile=mtp"; exit 2; } ;;
     --profile=*)  PROFILE="${arg#*=}" ;;
@@ -99,11 +102,39 @@ if grep -q '@[A-Z]\+@' "${RENDERED}"; then
   exit 1
 fi
 
+if [[ "${USER_SERVICE}" -eq 1 ]]; then
+  # Docker is the system daemon, not a unit in the user's manager.
+  sed -i -e '/^Requires=docker.service$/d' \
+         -e 's/^After=docker.service /After=/' \
+         -e '/^User=/d' -e '/^Group=/d' \
+         -e 's/^WantedBy=multi-user.target$/WantedBy=default.target/' "${RENDERED}"
+fi
+
 if [[ "${PRINT_UNIT:-0}" -eq 1 ]]; then
   # The pre-flight a cautious operator wants before touching /etc, and the only
   # part of this script that can be exercised without sudo.
   echo
   cat "${RENDERED}"
+  exit 0
+fi
+
+if [[ "${USER_SERVICE}" -eq 1 ]]; then
+  UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+  UNIT_PATH="${UNIT_DIR}/${UNIT_NAME}.service"
+  mkdir -p "${UNIT_DIR}"
+  if [[ -f "${UNIT_PATH}" ]] && ! cmp -s "${RENDERED}" "${UNIT_PATH}"; then
+    cp "${UNIT_PATH}" "${UNIT_PATH}.bak-$(date +%Y%m%dT%H%M%S)"
+  fi
+  cp "${RENDERED}" "${UNIT_PATH}"
+  systemctl --user daemon-reload
+  systemctl --user enable "${UNIT_NAME}.service"
+  echo
+  echo "== installed user service; NOT started yet."
+  echo "   systemctl --user start ${UNIT_NAME}"
+  echo "   journalctl --user -u ${UNIT_NAME} -f"
+  echo "   ./bin/qwen38 canary"
+  echo "   For boot without login, an administrator must enable user lingering:"
+  echo "   sudo loginctl enable-linger $(id -un)"
   exit 0
 fi
 

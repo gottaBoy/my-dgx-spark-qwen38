@@ -16,9 +16,10 @@ import socket
 import tempfile
 import unittest
 import urllib.request
+from unittest.mock import Mock, patch
 from pathlib import Path
 
-from qwen38 import net
+from qwen38 import guard, net, settings
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -43,13 +44,16 @@ def run_cli(*argv) -> tuple[int, str, str]:
     refuse-and-explain test into an error.
     """
     out, err = io.StringIO(), io.StringIO()
-    try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = cli.main(list(argv))
-    except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
-        if exc.code and isinstance(exc.code, str):
-            err.write(exc.code)
+    # Failure probes must not append simulated failures to a deployed run.
+    with tempfile.TemporaryDirectory(prefix="qwen38-cli-test-") as state, \
+         patch.dict(os.environ, {"Q38_STATE_DIR": state}):
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli.main(list(argv))
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+            if exc.code and isinstance(exc.code, str):
+                err.write(exc.code)
     return code, out.getvalue(), err.getvalue()
 
 
@@ -242,6 +246,53 @@ class TestStopIntentMarker(unittest.TestCase):
                         body.index('docker", "stop"'),
                         "guard must record intent before it stops the container")
 
+class TestServiceWatchdog(unittest.TestCase):
+    def test_dry_run_does_not_start_a_watchdog_or_wait_for_settle(self):
+        args = cli.build_parser().parse_args(["service-start", "--dry-run"])
+        with patch.object(cli, "cmd_start", return_value=0) as start, \
+             patch.object(cli.subprocess, "Popen") as popen, \
+             patch.object(cli.settle, "wait_until_stable") as settle_wait:
+            self.assertEqual(cli.cmd_service_start(settings.load(), args), 0)
+        start.assert_called_once()
+        popen.assert_not_called()
+        settle_wait.assert_not_called()
+
+    def test_guard_is_started_before_launch_and_cleaned_up_on_failure(self):
+        args = cli.build_parser().parse_args(["service-start"])
+        watchdog = Mock()
+        verdict = Mock(settled=True, drift_gib=0.0, samples=[90.0] * 3)
+        calls = []
+        with patch.object(cli.settle, "wait_until_stable", return_value=(verdict, 20)), \
+             patch.object(cli.subprocess, "Popen", side_effect=lambda *a, **k: calls.append("guard") or watchdog), \
+             patch.object(cli, "cmd_start", side_effect=lambda *a: calls.append("start") or 1), \
+             patch.object(cli, "_stop_is_intended", return_value=False):
+            self.assertEqual(cli.cmd_service_start(settings.load(), args), 1)
+        self.assertEqual(calls, ["guard", "start"])
+        watchdog.terminate.assert_called_once()
+        watchdog.wait.assert_called_once_with(timeout=10)
+
+    def test_guard_trip_during_boot_does_not_trigger_restart(self):
+        args = cli.build_parser().parse_args(["service-start"])
+        verdict = Mock(settled=True, drift_gib=0.0, samples=[90.0] * 3)
+        with patch.object(cli.settle, "wait_until_stable", return_value=(verdict, 20)), \
+             patch.object(cli.subprocess, "Popen"), \
+             patch.object(cli, "cmd_start", return_value=1), \
+             patch.object(cli, "_stop_is_intended", return_value=True):
+            self.assertEqual(cli.cmd_service_start(settings.load(), args), 0)
+
+    def test_guard_latches_readiness_and_uses_configured_full_threshold(self):
+        s = settings.load()
+        s.values["Q38_GUARD_PSI_FULL"] = "12.0"
+        s.values["Q38_GUARD_PSI_SOME"] = "25.0"
+        sample = guard.Sample(0.0, 7.0, 99.0)
+        with patch.object(cli, "_http_ok", side_effect=[False, True]) as health, \
+             patch.object(cli.guard, "read_sample", return_value=sample), \
+             patch.object(cli.time, "sleep", side_effect=[None, None, KeyboardInterrupt]), \
+             patch.object(cli, "_run") as run:
+            self.assertEqual(cli.cmd_guard(s, Mock()), 0)
+        self.assertEqual(health.call_count, 2)
+        run.assert_not_called()
+
 
 class TestHelpSurface(unittest.TestCase):
     @classmethod
@@ -402,6 +453,25 @@ class TestLocalRequestsBypassProxies(unittest.TestCase):
 
 
 class TestHealthProbesDoNotLie(unittest.TestCase):
+    def test_cli_state_is_isolated_cleaned_up_and_environment_restored(self):
+        seen = []
+
+        def fake_canary(s, args):
+            seen.append(s.state_dir)
+            cli._mark_stop_intended(s)
+            self.assertTrue(cli._stop_is_intended(s))
+            return 0
+
+        with tempfile.TemporaryDirectory() as live_state, \
+             patch.dict(os.environ, {"Q38_STATE_DIR": live_state}), \
+             patch.object(cli, "cmd_canary", side_effect=fake_canary):
+            code, _out, _err = run_cli("canary")
+            self.assertEqual(code, 0)
+            self.assertNotEqual(seen[0], Path(live_state))
+            self.assertFalse(seen[0].exists())
+            self.assertFalse(cli._stop_is_intended(settings.load()))
+            self.assertEqual(os.environ["Q38_STATE_DIR"], live_state)
+
     def test_refused_connection_is_reported_as_unreachable_not_as_a_crash(self):
         # An OSConnectionError must land in the "unreachable" branch; the 502
         # above arrived as HTTPError, which is a different exception class and
@@ -410,6 +480,21 @@ class TestHealthProbesDoNotLie(unittest.TestCase):
             code, _out, err = run_cli("canary")
         self.assertEqual(code, 1)
         self.assertIn("FAIL", _out + err)
+
+
+class TestBenchmarkReporting(unittest.TestCase):
+    def test_different_workloads_are_not_reported_as_one_noise_distribution(self):
+        counts = [16, 60, 600, 60, 600]
+        times = [0, 1, 1, 2, 2, 12, 12, 13, 13, 43]
+        with patch.object(cli, "_api", side_effect=[
+                {"usage": {"completion_tokens": count}} for count in counts]), \
+             patch.object(cli.time, "time", side_effect=times):
+            code, out, err = run_cli("bench", "--repeats", "1")
+        self.assertEqual(code, 0, err)
+        self.assertIn("60.00 tok/s", out)
+        self.assertIn("18.62 tok/s", out)
+        self.assertIn("per-probe ranges", out)
+        self.assertNotIn("Run-to-run spread", out)
 
 
 if __name__ == "__main__":

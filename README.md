@@ -29,14 +29,33 @@ produced it.
 ## Layout
 
 ```
-bin/qwen38          the CLI: 19 subcommands, stdlib only
+bin/qwen38          the CLI, stdlib only
 lib/qwen38/         pure logic, tested offline on any machine
 conf/config.defaults  every knob, one KEY="value" file, read by shell and Python alike
 unit/               systemd template, rendered by install.sh
-tests/              143 offline tests with captured /proc and sysfs fixtures
+tests/              offline tests with captured /proc and sysfs fixtures
 docs/               the operational tutorial and the tuning curriculum
 state/              logs, the run ledger, watch records (gitignored)
 ```
+
+On a shared host, use the settings in `conf/config.shared.example`: 128K context,
+a 0.50 fraction ceiling and 32 GiB headroom. These are the reference box's current
+acceptance settings, not a guarantee for a different host. Weights occupy
+25.72 GiB on disk; the serving process also allocates KV/state/graph/workspace
+memory, so that number is not its runtime memory budget.
+
+Without passwordless sudo, use the same installer with the user's manager:
+
+```bash
+./install.sh --user
+systemctl --user start qwen38-spark
+loginctl show-user "$USER" -p Linger
+```
+
+`Linger=yes` is required for boot without login. Enable it with
+`loginctl enable-linger "$USER"` where permitted, or ask the administrator.
+Use only one manager for this container. The service supervises its watchdog
+through boot and steady-state serving.
 
 ## Install
 
@@ -69,6 +88,8 @@ so weights that "download on first boot" never finish downloading.
 | Understand *why* a knob matters and how to measure it | [docs/TUNING-CURRICULUM.md](docs/TUNING-CURRICULUM.md) |
 | The reasoning behind the design, in one pass | [docs/DESIGN.md](docs/DESIGN.md) |
 | Every command | `./bin/qwen38 --help`, then `--help` on the subcommand |
+| Which upstream details were borrowed and verified | [docs/UPSTREAM-ANALYSIS.md](docs/UPSTREAM-ANALYSIS.md) |
+| The accepted local deployment, measurements and remaining limits | [docs/DEPLOYMENT-2026-09-27.md](docs/DEPLOYMENT-2026-09-27.md) |
 
 ## The four facts about this hardware that shaped the design
 

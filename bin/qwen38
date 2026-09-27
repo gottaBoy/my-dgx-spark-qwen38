@@ -231,8 +231,7 @@ def cmd_doctor(s: settings.Settings, args: argparse.Namespace) -> int:
     if docker_ok:
         proc = _run(["docker", "ps", "--filter", f"name=^/{CONTAINER}$", "--format", "{{.Names}} {{.Status}}"])
         add("our container free", not proc.stdout.strip(), proc.stdout.strip() or "not running")
-        proc = _run(["docker", "images", "-q", s.get("Q38_IMAGE_DIGEST")], timeout=60)
-        have_image = bool(proc.stdout.strip())
+        have_image = docker_present(s)
         # A missing image is a WARN, not a FAIL: installing does not need it, only
         # starting does, and cmd_start refuses on its own. Grading it FAIL here
         # would make install.sh unrunnable on the fresh box it is meant for.
@@ -262,6 +261,7 @@ def cmd_doctor(s: settings.Settings, args: argparse.Namespace) -> int:
     sample = guard.read_sample()
     verdict, reason = guard.Guard(guard.Thresholds(
         psi_some=s.float("Q38_GUARD_PSI_SOME"),
+        psi_full=s.float("Q38_GUARD_PSI_FULL"),
         available_floor_gib=s.float("Q38_GUARD_AVAIL_FLOOR_GIB"),
     )).decide(sample)
     add("memory pressure", verdict == "ok", f"PSI some {sample.psi_some_avg10}% / full {sample.psi_full_avg10}% / avail {sample.available_gib} GiB" + (f" -- {reason}" if reason else ""))
@@ -608,12 +608,14 @@ def cmd_start(s: settings.Settings, args: argparse.Namespace) -> int:
     sample = guard.read_sample()
     gate = guard.Guard(guard.Thresholds(
         psi_some=s.float("Q38_GUARD_PSI_SOME"),
-        available_floor_gib=s.float("Q38_GUARD_AVAIL_FLOOR_GIB")))
+        psi_full=s.float("Q38_GUARD_PSI_FULL"),
+        available_floor_gib=s.float("Q38_GUARD_AVAIL_FLOOR_GIB"),
+        strikes=1))
     verdict, reason = gate.decide(sample)
     if verdict == "trip":
         print(f"REFUSED: host is already under memory pressure ({reason}).\n"
-              f"Nothing was launched. Wait, or free memory, or lower Q38_RESERVED_GIB\n"
-              f"if you own this box.", file=sys.stderr)
+              f"Nothing was launched. Wait for pressure to subside; do not stop\n"
+              f"neighbour services or reduce their reserved headroom.", file=sys.stderr)
         return 3
 
     chosen, probes = ports.choose([s.int("Q38_PORT"), s.int("Q38_STATUS_PORT")])
@@ -632,7 +634,7 @@ def cmd_start(s: settings.Settings, args: argparse.Namespace) -> int:
         max_fraction=s.float("Q38_MAX_FRACTION"), cuda_total_gib=cuda_total)
     args._fit = fit
     if fit.fraction == 0.0 or fit.bound_by == "no-headroom":
-        print("REFUSED: " + (fit.warnings[0] if fit.warnings else "no memory budget"), file=sys.stderr)
+        print("REFUSED: " + ("; ".join(fit.warnings) if fit.warnings else "no memory budget"), file=sys.stderr)
         return 3
 
     inputs = _build_inputs(s, args)
@@ -657,7 +659,7 @@ def cmd_start(s: settings.Settings, args: argparse.Namespace) -> int:
     log_path = s.state_dir / "engine.log"
 
     print(f"launching profile {inputs.profile} on :{inputs.port} "
-          f"(fraction {inputs.mem_fraction}, cpuset {inputs.cpuset or 'off'})")
+          f"(fraction {inputs.mem_fraction}, cpuset {inputs.cpuset or 'off'})", flush=True)
     proc = _run(list(built.docker_argv), timeout=180)
     if proc.returncode != 0:
         print(f"docker run failed: {proc.stderr.strip()[:600]}", file=sys.stderr)
@@ -698,9 +700,11 @@ def _start_dry_run(s: settings.Settings, args: argparse.Namespace) -> int:
     print("[dry-run] nothing launched, nothing pulled, nothing written.")
     print(f"  fit       : {fit.fraction} -- {fit.cuda_total_source}; "
           f"bound by {fit.bound_by}. Run `qwen38 fit` to measure the pool.")
-    print(f"  refuse if : PSI some >= {s.float('Q38_GUARD_PSI_SOME')}% "
-          f"or MemAvailable < {s.float('Q38_GUARD_AVAIL_FLOOR_GIB')} GiB "
-          f"for {s.int('Q38_GUARD_TRIP_STRIKES')} consecutive samples")
+    print(f"  refuse if : preflight PSI some >= {s.float('Q38_GUARD_PSI_SOME')}% "
+          f"or full >= {s.float('Q38_GUARD_PSI_FULL')}% "
+          f"or MemAvailable < {s.float('Q38_GUARD_AVAIL_FLOOR_GIB')} GiB")
+    print(f"  watchdog  : {s.int('Q38_GUARD_TRIP_STRIKES')} consecutive breaches; "
+          "during boot PSI warns, but the available-memory floor stays active")
     print(f"  ports     : would probe {s.get('Q38_PORT')},{s.get('Q38_STATUS_PORT')} "
           f"and take the first free one below the ephemeral floor")
     print(f"  cpuset    : {built.inputs.cpuset or '(unpinned)'}")
@@ -721,7 +725,7 @@ def cmd_wait(args: argparse.Namespace, *, settings: settings.Settings | None = N
     ledger = _ledger(s)
     deadline = time.time() + args.timeout
     started = time.time()
-    print(f"waiting for :{port} (CUDA graph capture + kernel compile; up to {args.timeout}s)")
+    print(f"waiting for :{port} (CUDA graph capture + kernel compile; up to {args.timeout}s)", flush=True)
     while time.time() < deadline:
         running = _run(["docker", "ps", "--format", "{{.Names}}"]).stdout.split()
         if CONTAINER not in running:
@@ -755,7 +759,9 @@ def cmd_service_start(s: settings.Settings, args: argparse.Namespace) -> int:
     capture, which is how upstream documents "hard reboot, root cause unclear".
     Settling is what closes the race instead of lowering a constant to hide it.
     """
-    print("settling: waiting for host memory to stop moving before fitting")
+    if args.dry_run:
+        return cmd_start(s, args)
+    print("settling: waiting for host memory to stop moving before fitting", flush=True)
     verdict, spent = settle.wait_until_stable(
         lambda: memfit.read_host_memory().available_gib,
         max_drift_gib=s.float("Q38_SETTLE_MAX_DRIFT_GIB"),
@@ -775,19 +781,26 @@ def cmd_service_start(s: settings.Settings, args: argparse.Namespace) -> int:
               f"Q38_SETTLE_DEADLINE_S if the boot is simply slow.", file=sys.stderr)
         return 3
     print(f"settled after {spent:.0f}s (drift {verdict.drift_gib} GiB over "
-          f"{len(verdict.samples)} samples)")
-    rc = cmd_start(s, args)
-    if rc != 0:
-        return rc
-    # Block here on purpose. Under Type=simple, systemd treats this process as
-    # the service, so returning after a successful boot would mark the unit
-    # inactive while the container keeps serving -- a unit that says "inactive"
-    # next to a healthy engine is how operators stop trusting `systemctl status`.
-    # Following the engine's log keeps the process alive AND puts SGLang's own
-    # output in the journal, so `journalctl -u qwen38-spark` needs no second
-    # command. systemd stops us with SIGTERM, we exit, and ExecStop runs
-    # `qwen38 stop`, which is the ordering we want.
-    return _follow_engine_logs(s)
+          f"{len(verdict.samples)} samples)", flush=True)
+    # The watchdog shares the unit's lifecycle and covers compilation too.
+    # Following engine logs afterwards keeps Type=simple active and journals
+    # SGLang output. ExecStop handles the container on a deliberate unit stop.
+    watchdog = subprocess.Popen(
+        [sys.executable, str(s.root / "bin" / "qwen38"), "guard"])
+    try:
+        rc = cmd_start(s, args)
+        if rc != 0:
+            # A guard trip during boot is intentional too: never restart into
+            # the pressure that just stopped us.
+            return 0 if _stop_is_intended(s) else rc
+        return _follow_engine_logs(s)
+    finally:
+        watchdog.terminate()
+        try:
+            watchdog.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            watchdog.kill()
+            watchdog.wait()
 
 
 def _follow_engine_logs(s: settings.Settings) -> int:
@@ -1147,9 +1160,9 @@ def cmd_bench(s: settings.Settings, args: argparse.Namespace) -> int:
             print("  not recorded: no matching run id (start with qwen38 start to get one)",
                   file=sys.stderr)
     if results:
-        flat = [v for values in results.values() for v in values]
         print(f"\ncaveat: within one boot, deltas below ~15% are noise on this hardware. "
-              f"Run-to-run spread here is {round((max(flat) - min(flat)) / (sum(flat) / len(flat)) * 100, 1)}%.")
+              "Use the per-probe ranges above; different workloads are not "
+              "samples of the same throughput.")
     return 0 if results else 1
 
 
@@ -1157,17 +1170,24 @@ def cmd_guard(s: settings.Settings, args: argparse.Namespace) -> int:
     """Watchdog. Trips by stopping OUR container, never by touching a neighbour."""
     thresholds = guard.Thresholds(
         psi_some=s.float("Q38_GUARD_PSI_SOME"),
+        psi_full=s.float("Q38_GUARD_PSI_FULL"),
         available_floor_gib=s.float("Q38_GUARD_AVAIL_FLOOR_GIB"),
         strikes=s.int("Q38_GUARD_TRIP_STRIKES"))
     state = guard.Guard(thresholds)
     interval = s.int("Q38_GUARD_INTERVAL_S")
-    print(f"guard: PSI some >= {thresholds.psi_some}% or avail < {thresholds.available_floor_gib} GiB "
-          f"for {thresholds.strikes} consecutive {interval}s samples stops {CONTAINER}")
+    print(f"guard: PSI some >= {thresholds.psi_some}% or full >= {thresholds.psi_full}% "
+          f"or avail < {thresholds.available_floor_gib} GiB for {thresholds.strikes} "
+          f"consecutive {interval}s samples stops {CONTAINER}; "
+          "before readiness only the available-memory floor trips", flush=True)
     samples = 0
+    ready = False
     try:
         while True:
+            if not ready and _http_ok(s.int("Q38_PORT"), timeout=1.0):
+                ready = True
+                print("guard: engine ready; steady-state PSI protection enabled", flush=True)
             sample = guard.read_sample()
-            verdict, reason = state.decide(sample)
+            verdict, reason = state.decide(sample, ready=ready)
             samples += 1
             if verdict != "ok":
                 print(f"[{time.strftime('%H:%M:%S')}] {verdict.upper()}: {reason}", flush=True)
